@@ -1,4 +1,5 @@
 .vscode/
 logs/
 lemonade_env/
-venv/
+venv/VersionN/data/*.tar.gz
+VersionN/data/*.tar.gz
