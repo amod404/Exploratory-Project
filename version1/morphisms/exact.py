@@ -380,18 +380,20 @@ def apply_skip_connection(
     new_id = max(new_graph.nodes.keys()) + 1
 
     merge_node = Node(
-        id=new_id,
+        new_id,
         op="add",
         params={},
         parents=[from_node, to_node],
     )
 
     # redirect output of to_node
-    for n in new_graph.nodes.values():
-        n.parents = [
-            new_id if p == to_node else p
-            for p in n.parents
-        ]
+    target = new_graph.nodes[to_node]
+    target.parent = [new_id]
+    # for n in new_graph.nodes.values():
+    #     n.parents = [
+    #         new_id if p == to_node else p
+    #         for p in n.parents
+    #     ]
 
     new_graph.add_node(merge_node)
 

@@ -6,3 +6,5 @@ venv/
 logs/
 
 *.log
+
+__pycache__/
