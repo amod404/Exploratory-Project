@@ -11,5 +11,6 @@ def print_tree(path):
 
         if os.path.isdir(full):
             print_tree(full)
+        
 
 print_tree(".")

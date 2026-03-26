@@ -1,0 +1,404 @@
+The Final Evaluation Phase (Post-Search): Once LEMONADE finishes all its generations, it hands you a Pareto front of the best architectures. You pick your favorite one (the "winner"). Now you want to squeeze every last drop of performance out of it to match the state-of-the-art results in the paper. This is when you build a bigger version of that winning cell, train it for 600+ epochs, and hit it with heavy regularization like Shake-Shake and Cutout.
+
+
+
+Evaluaiton phase:
+
+1.
+add this at end of main.py (for finding best from the ones left after all gens)
+
+# --- ADD THIS AT THE END OF main.py ---
+    import pickle
+    
+    # Find the model with the lowest validation error on the Pareto front
+    best_model = None
+    best_error = float('inf')
+    
+    for ind in final_population:
+        if ind.f_exp is not None:
+            err = ind.f_exp.get("val_error", float('inf'))
+            if err < best_error:
+                best_error = err
+                best_model = ind
+                
+    if best_model is not None:
+        logger.info(f"Saving best model with val_error {best_error:.4f} to best_graph.pkl")
+        with open("best_graph.pkl", "wb") as f:
+            pickle.dump(best_model.graph, f)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+2.
+Create a new file utils/cutout.py:
+
+Python
+# utils/cutout.py
+import torch
+import numpy as np
+
+class Cutout(object):
+    """Randomly mask out one or more patches from an image."""
+    def __init__(self, length):
+        self.length = length
+
+    def __call__(self, img):
+        """
+        Args:
+            img (Tensor): Tensor image of size (C, H, W).
+        Returns:
+            Tensor: Image with n_holes of dimension length x length cut out of it.
+        """
+        h = img.size(1)
+        w = img.size(2)
+
+        mask = np.ones((h, w), np.float32)
+
+        y = np.random.randint(h)
+        x = np.random.randint(w)
+
+        y1 = np.clip(y - self.length // 2, 0, h)
+        y2 = np.clip(y + self.length // 2, 0, h)
+        x1 = np.clip(x - self.length // 2, 0, w)
+        x2 = np.clip(x + self.length // 2, 0, w)
+
+        mask[y1:y2, x1:x2] = 0.
+
+        mask = torch.from_numpy(mask)
+        mask = mask.expand_as(img)
+        img = img * mask
+
+        return img
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+3. Regularizations: Step 2: Create the True Macro-Architecture (models/shake_shake.py)
+Create this file. This represents the official Shake-Shake structure. It handles the parallel branches natively, meaning your graph compiler doesn't have to worry about it.
+
+Python
+# models/shake_shake.py
+import torch
+import torch.nn as nn
+from torch.autograd import Function
+from architectures.compiler import CompiledModel
+
+class ShakeFunction(Function):
+    @staticmethod
+    def forward(ctx, x1, x2, training=True):
+        if training:
+            alpha = torch.rand(x1.size(0), 1, 1, 1, device=x1.device)
+            return alpha * x1 + (1 - alpha) * x2
+        else:
+            return 0.5 * x1 + 0.5 * x2
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        beta = torch.rand(grad_output.size(0), 1, 1, 1, device=grad_output.device)
+        return beta * grad_output, (1 - beta) * grad_output, None
+
+class ShakeShake(nn.Module):
+    def forward(self, x1, x2):
+        return ShakeFunction.apply(x1, x2, self.training)
+
+class ShakeShakeBlock(nn.Module):
+    """
+    Exactly what the NAS papers do: 
+    Input -> [Branch 1: Discovered Cell] \
+                                          [Shake-Shake] + [Skip Connection] -> Output
+    Input -> [Branch 2: Discovered Cell] /
+    """
+    def __init__(self, cell_graph, in_channels, out_channels, stride=1):
+        super().__init__()
+        
+        # 1. Skip Connection (handles spatial downsampling and channel expansion)
+        if stride != 1 or in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.skip = nn.Identity()
+
+        # 2. Parallel Branches (Two independent copies of the discovered cell)
+        # We put a projection in front of them so your compiler receives the exact channels/strides it needs
+        self.prep1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.prep2 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.branch1 = CompiledModel(cell_graph)
+        self.branch2 = CompiledModel(cell_graph)
+        
+        self.shake_shake = ShakeShake()
+
+    def forward(self, x):
+        b1 = self.prep1(x)
+        out1 = self.branch1(b1)
+        
+        b2 = self.prep2(x)
+        out2 = self.branch2(b2)
+        
+        shaked = self.shake_shake(out1, out2)
+        return shaked + self.skip(x)
+
+class FinalShakeShakeNet(nn.Module):
+    """
+    The full Macro-Architecture for evaluating a cell.
+    Stacks the ShakeShakeBlocks in 3 stages (standard for CIFAR).
+    """
+    def __init__(self, cell_graph, init_channels=32, num_blocks_per_stage=4, num_classes=10):
+        super().__init__()
+        
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, init_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        c = init_channels
+        
+        # Stage 1: 32x32
+        self.stage1 = self._make_stage(cell_graph, c, c, num_blocks_per_stage, stride=1)
+        # Stage 2: 16x16 (Downsample)
+        self.stage2 = self._make_stage(cell_graph, c, c*2, num_blocks_per_stage, stride=2)
+        c = c * 2
+        # Stage 3: 8x8 (Downsample)
+        self.stage3 = self._make_stage(cell_graph, c, c*2, num_blocks_per_stage, stride=2)
+        c = c * 2
+        
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # LazyLinear auto-infers the in_features size during the first forward pass.
+        self.fc = nn.LazyLinear(num_classes)
+
+    def _make_stage(self, cell_graph, in_c, out_c, num_blocks, stride):
+        blocks = []
+        blocks.append(ShakeShakeBlock(cell_graph, in_c, out_c, stride))
+        for _ in range(1, num_blocks):
+            blocks.append(ShakeShakeBlock(cell_graph, out_c, out_c, 1))
+        return nn.Sequential(*blocks)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+4. Final trainer:
+# train_final.py
+import os
+import pickle
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader
+
+from models.shake_shake import FinalShakeShakeNet
+from utils.cutout import Cutout
+from utils.logger import get_logger
+
+logger = get_logger("train_final", logfile="logs/train_final.log")
+
+def get_final_loaders(batch_size=96, cutout_length=16):
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        Cutout(length=cutout_length),
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    train_data = datasets.CIFAR10(root='./data/dataset', train=True, download=True, transform=train_transform)
+    val_data = datasets.CIFAR10(root='./data/dataset', train=False, download=True, transform=val_transform)
+
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    return train_loader, val_loader
+
+def strip_classification_head(graph):
+    """
+    Removes Flatten and Linear nodes so the graph acts purely as a cell 
+    for the Shake-Shake blocks.
+    """
+    nodes_to_remove = []
+    for node_id, node in graph.nodes.items():
+        op = getattr(node, "op_type", getattr(node, "op", "")).lower()
+        if op in ('flatten', 'linear', 'fc'):
+            nodes_to_remove.append(node_id)
+            
+    for node_id in nodes_to_remove:
+        del graph.nodes[node_id]
+        
+    if nodes_to_remove:
+        # Re-assign the output node to the last remaining convolutional/activation node
+        graph.output_node = max(graph.nodes.keys())
+        
+    return graph
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Starting Final Evaluation on {device}...")
+
+    # 1. Load the Best Graph
+    graph_path = "best_graph.pkl"
+    if not os.path.exists(graph_path):
+        logger.error(f"Could not find {graph_path}. Run main.py first!")
+        return
+        
+    with open(graph_path, "rb") as f:
+        best_graph = pickle.load(f)
+
+    # 2. Prepare Graph and Build True Macro Architecture
+    cell_graph = strip_classification_head(best_graph)
+    
+    # 4 blocks per stage = 12 total cells duplicated in parallel
+    model = FinalShakeShakeNet(cell_graph, init_channels=32, num_blocks_per_stage=4)
+    model = model.to(device)
+
+    # 3. Setup Hyperparameters and Data
+    train_loader, val_loader = get_final_loaders(batch_size=96)
+
+    EPOCHS = 600
+    LEARNING_RATE = 0.025
+    MOMENTUM = 0.9
+    WEIGHT_DECAY = 3e-4
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    # Run a dummy forward pass to initialize the LazyLinear layer
+    dummy_input = torch.randn(2, 3, 32, 32).to(device)
+    _ = model(dummy_input)
+
+    # 4. Training Loop
+    logger.info(f"Beginning training for {EPOCHS} epochs.")
+    best_val_acc = 0.0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        correct, total = 0, 0
+        
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            
+        scheduler.step()
+        
+        # Validation Loop
+        model.eval()
+        v_correct, v_total = 0, 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                v_total += targets.size(0)
+                v_correct += predicted.eq(targets).sum().item()
+                
+        val_acc = 100. * v_correct / v_total
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), "final_model_weights.pth")
+
+        logger.info(f"Epoch {epoch+1}/{EPOCHS} | Train Acc: {100.*correct/total:.2f}% | Val Acc: {val_acc:.2f}%")
+
+if __name__ == "__main__":
+    main()

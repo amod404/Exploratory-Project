@@ -3,8 +3,9 @@
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import torch
-from architectures.node import Node
+
 from architectures.graph import ArchitectureGraph
+from models.base_net import build_sequential_macro_architecture
 from evolution.lemonade_full import run_lemonade
 from data.cifar10 import get_cifar_loaders
 from utils.logger import get_logger
@@ -14,59 +15,28 @@ logger = get_logger("main", logfile="logs/main.log")
 
 def seed_graph():
     """
-    Stronger baseline:
-    Conv32 → BN → ReLU → Pool
-    Conv64 → BN → ReLU → Pool
-    Flatten → Linear
+    Generates the initial starting graph using the sequentially 
+    stacked cells scheme as outlined for LEMONADE.
     """
-    g = ArchitectureGraph()
+    # Start small so the evolutionary morphisms can grow the network
+    return build_sequential_macro_architecture(
+        in_channels=3,
+        init_channels=16,
+        num_classes=10,
+        num_cells=4, # 4 initial cells stacked sequentially
+        image_size=32
+    )
 
-    # Block 1
-    g.add_node(Node(0, 'conv', {
-        'in_channels': 3,
-        'out_channels': 32,
-        'kernel_size': 3,
-        'padding': 1
-    }, parents=[]))
-
-    g.add_node(Node(1, 'bn', {'num_features': 32}, parents=[0]))
-    g.add_node(Node(2, 'relu', {}, parents=[1]))
-    g.add_node(Node(3, 'maxpool', {'kernel_size': 2}, parents=[2]))  # 32→16
-
-    # Block 2
-    g.add_node(Node(4, 'conv', {
-        'in_channels': 32,
-        'out_channels': 64,
-        'kernel_size': 3,
-        'padding': 1
-    }, parents=[3]))
-
-    g.add_node(Node(5, 'bn', {'num_features': 64}, parents=[4]))
-    g.add_node(Node(6, 'relu', {}, parents=[5]))
-    g.add_node(Node(7, 'maxpool', {'kernel_size': 2}, parents=[6]))  # 16→8
-
-    # Head
-    g.add_node(Node(8, 'flatten', {}, parents=[7]))
-
-    g.add_node(Node(9, 'linear', {
-        'in_features': 64 * 8 * 8,
-        'out_features': 10
-    }, parents=[8]))
-
-    g.set_output(9)
-
-    return g
 
 def main():
 
     logger.info("Starting FULL LEMONADE experiment")
 
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
     device = "cpu"
     logger.info("Using device: %s", device)
 
     # -------------------------------------------------
-    # Load CIFAR-10 (correct function name)
+    # Load CIFAR-10
     # -------------------------------------------------
     train_loader, val_loader = get_cifar_loaders(batch_size=128)
 
@@ -77,8 +47,8 @@ def main():
         init_graphs=[seed_graph() for _ in range(2)],
         generations=6,
         n_children=10,
-        n_accept=6,      # 🔥 important
-        epochs=3,        # faster
+        n_accept=6,
+        epochs=3,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
