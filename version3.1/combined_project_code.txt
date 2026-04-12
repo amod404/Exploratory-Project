@@ -83,7 +83,14 @@ PATH:   .\config.py
 # config.py
 # =============================================================================
 # ALL USER-FACING HYPERPARAMETERS ARE IN THIS ONE FILE.
-# Change values here; nothing else needs to be touched for normal experiments.
+# Change values here; nothing else needs to be touched.
+#
+# GPU / Colab notes:
+#   - Set USE_AMP=True  for 1.5-2x speedup on any NVIDIA GPU (T4, A100, V100)
+#   - Set NUM_DATALOADER_WORKERS=2 on Colab (it has 2 CPU cores for prefetch)
+#   - BATCH_SIZE=256 works on Colab T4 for CIFAR; use 128 to be safe
+#   - ProcessPoolExecutor is automatically disabled when CUDA is available;
+#     models are trained sequentially on the GPU instead (much faster).
 # =============================================================================
 
 from dataclasses import dataclass, field
@@ -107,15 +114,12 @@ class NASConfig:
 
     # -------------------------------------------------------------------------
     # Cheap Objectives
-    # Controls what enters KDE sampling + Pareto dominance.
     # Options: any subset of ["params", "flops"]
-    #   ["params", "flops"]  → full multi-objective (slower, needs thop)
-    #   ["params"]           → params-only (fast, no model build for cheap eval)
+    #   ["params", "flops"]  → full multi-objective (needs thop)
+    #   ["params"]           → params-only (fastest, recommended for Colab)
     #   []                   → single-objective NAS (val_error only)
     # -------------------------------------------------------------------------
     CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params"])
-    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: [])
-    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params", "flops"])
 
     # -------------------------------------------------------------------------
     # Evolution
@@ -127,29 +131,27 @@ class NASConfig:
     N_CHILDREN: int = 24
 
     # nac: how many pass the KDE filter and enter expensive training.
-    # Ratio N_CHILDREN / N_ACCEPT should be at least 3:1 for meaningful filtering.
+    # Ratio N_CHILDREN / N_ACCEPT should be at least 3:1.
     N_ACCEPT: int = 8
 
     # Hard parameter cap; children exceeding this are discarded before training.
     MAX_PARAMS: int = 10_000_000
 
-    # Minimum Pareto population size.  If Pareto front shrinks below this,
-    # diverse dominated individuals are added to maintain breadth.
+    # Minimum Pareto population size.
     MIN_POP: int = 3
 
     # -------------------------------------------------------------------------
-    # Training Epochs  (THREE distinct phases — do NOT conflate them)
+    # Training Epochs  (THREE distinct phases)
     #
-    #   INIT_EPOCHS   : Gen 0 — training the seed population from scratch
-    #   CHILD_EPOCHS  : Gen 1+ — standard training for every accepted child
-    #   DISTILL_EPOCHS: ANM children only — distillation alignment BEFORE
-    #                   the standard CHILD_EPOCHS training phase
+    #   INIT_EPOCHS   : Gen 0 — training seed population from scratch
+    #   CHILD_EPOCHS  : Gen 1+ — standard training for accepted children
+    #   DISTILL_EPOCHS: ANM children only — distillation BEFORE CHILD_EPOCHS
     # -------------------------------------------------------------------------
     INIT_EPOCHS: int = 20
     CHILD_EPOCHS: int = 12
     DISTILL_EPOCHS: int = 5
 
-    # Set True to add +1 epoch every 5 generations (slow convergence boost)
+    # Set True to add +1 epoch every 5 generations
     EPOCH_PROGRESSION: bool = True
 
     # -------------------------------------------------------------------------
@@ -158,35 +160,42 @@ class NASConfig:
     # -------------------------------------------------------------------------
     OPTIMIZER: str = "sgd"
 
-    # Learning rates — separate per phase
-    # INIT_LR: float = 0.025        # Gen 0
-    # CHILD_LR: float = 0.01      # Gen 1+ training
-    # DISTILL_LR: float = 0.005    # Distillation alignment
-    INIT_LR: float = 0.01        # Gen 0
-    CHILD_LR: float = 0.005      # Gen 1+ training
-    DISTILL_LR: float = 0.001    # Distillation alignment
+    INIT_LR: float = 0.01
+    CHILD_LR: float = 0.005
+    DISTILL_LR: float = 0.001
 
-    # WEIGHT_DECAY: float = 3e-4
     WEIGHT_DECAY: float = 1e-4
 
-    # Distillation settings
     DISTILL_TEMPERATURE: float = 3.0
-    # 0.0 = pure teacher-mimicking, 1.0 = pure cross-entropy on hard labels
-    DISTILL_ALPHA: float = 0.0
+    DISTILL_ALPHA: float = 0.0   # 0.0 = pure KD, 1.0 = pure CE
 
     # -------------------------------------------------------------------------
-    # KDE Sampler
-    # Higher bandwidth → smoother density → more exploration (good early on).
-    # Lower bandwidth → sharper density → more exploitation (good later).
+    # KDE Sampler bandwidth
     # -------------------------------------------------------------------------
     KDE_BANDWIDTH: float = 0.3
 
     # -------------------------------------------------------------------------
+    # GPU / Performance
+    # -------------------------------------------------------------------------
+    # Automatic Mixed Precision (fp16 forward + fp32 gradients).
+    # Gives 1.5-2x speedup on NVIDIA GPUs with almost no accuracy loss.
+    # Automatically disabled if CUDA is not available.
+    USE_AMP: bool = True
+
+    # DataLoader worker processes for the MAIN process.
+    # Set 2 on Colab (it has 2 prefetch-CPU cores).
+    # Set 0 on Windows or if you hit "RuntimeError: DataLoader worker" errors.
+    # CPU subprocess workers always use 0 (nested MP is not safe).
+    NUM_DATALOADER_WORKERS: int = 2
+
+    # Pin memory for fast CPU→GPU transfers.
+    # Automatically forced to False when CUDA is unavailable.
+    PIN_MEMORY: bool = True
+
+    # -------------------------------------------------------------------------
     # UX / Debugging
     # -------------------------------------------------------------------------
-    # Set False for non-interactive environments (CI, HPC) or when logs are
-    # preferred over animated bars.  Workers always suppress their own bars.
-    SHOW_PROGRESS_BAR: bool = False
+    SHOW_PROGRESS_BAR: bool = True
 
 
 # Singleton — import this everywhere
@@ -207,17 +216,25 @@ PATH:   .\main.py
 # =============================================================================
 # Entry point for LEMONADE NAS.
 # ALL hyperparameters live in config.py — edit them there.
+#
+# Google Colab usage:
+#   1. Upload your project folder to Colab (or mount Google Drive)
+#   2. Run: !pip install thop tqdm scikit-learn   (one-time setup)
+#   3. Run this file as a cell:  !python main.py
+#      OR import and call: from main import main; main()
 # =============================================================================
 
 import os
+import multiprocessing
 
-# Must be set BEFORE any PyTorch import to prevent thread-count explosion
-# in multiprocessing workers.
-os.environ["OMP_NUM_THREADS"]         = "1"
-os.environ["MKL_NUM_THREADS"]         = "1"
-os.environ["OPENBLAS_NUM_THREADS"]    = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"]  = "1"
-os.environ["NUMEXPR_NUM_THREADS"]     = "1"
+# ---- Thread-count lock (must happen before any torch import) ----
+# On Colab with GPU we don't use subprocesses for training, so these are
+# mainly a safety net for CPU fallback workers.
+os.environ.setdefault("OMP_NUM_THREADS",        "1")
+os.environ.setdefault("MKL_NUM_THREADS",        "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS",   "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS",    "1")
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -227,7 +244,7 @@ import pickle
 import datetime
 import torch
 
-from config import CFG                          # ← single source of truth
+from config import CFG
 from evolution.lemonade_full import run_lemonade
 from evolution.operators import random_operator
 from evolution.individual import Individual
@@ -236,7 +253,6 @@ from utils.logger import get_logger
 
 logger = get_logger("main", logfile="logs/main.log")
 
-
 # =============================================================================
 # Dataset + num_classes wiring
 # =============================================================================
@@ -244,14 +260,12 @@ logger = get_logger("main", logfile="logs/main.log")
 _DATASET_META = {
     "CIFAR-10":  (10,   128),
     "CIFAR-100": (100,  128),
-    "IMAGENET":  (1000,  32),   # smaller batch for large images
+    "IMAGENET":  (1000,  32),
 }
 
 NUM_CLASSES = _DATASET_META[CFG.TARGET_DATASET][0]
-# Override batch size if dataset has a tighter default
-if CFG.BATCH_SIZE == 128 and CFG.TARGET_DATASET == "IMAGENET":
-    CFG.BATCH_SIZE = 32
-
+if CFG.TARGET_DATASET == "IMAGENET" and CFG.BATCH_SIZE == 128:
+    CFG.BATCH_SIZE = 32   # ImageNet needs smaller batch on GPU
 
 # =============================================================================
 # Seed population
@@ -268,7 +282,7 @@ def create_seed_population(num_seeds: int) -> list:
     graphs = [base_graph]
 
     for _ in range(num_seeds - 1):
-        for _ in range(15):        # up to 15 attempts to produce a valid variant
+        for _ in range(15):
             tmp = Individual(copy.deepcopy(base_graph))
             new_graph, _, _ = random_operator(tmp)
             if new_graph is None:
@@ -279,14 +293,12 @@ def create_seed_population(num_seeds: int) -> list:
                     objective_keys=CFG.CHEAP_OBJECTIVES,
                     input_size=(1, 3, 32, 32),
                 )
-                param_count = cheap.get("params", 0)
-                if param_count <= CFG.MAX_PARAMS:
+                if cheap.get("params", 0) <= CFG.MAX_PARAMS:
                     graphs.append(new_graph)
                     break
             except Exception:
                 continue
         else:
-            # Fallback: use a copy of base (better than crashing)
             graphs.append(copy.deepcopy(base_graph))
 
     logger.info("Seed population ready: %d architectures", len(graphs))
@@ -298,7 +310,25 @@ def create_seed_population(num_seeds: int) -> list:
 # =============================================================================
 
 def main():
-    logger.info("Starting LEMONADE NAS on %s", CFG.TARGET_DATASET)
+    # ------------------------------------------------------------------
+    # Device detection with detailed info
+    # ------------------------------------------------------------------
+    if torch.cuda.is_available():
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"\n  GPU detected: {gpu_name}  ({gpu_mem:.1f} GB VRAM)")
+        print(f"  AMP (fp16): {'ENABLED' if CFG.USE_AMP else 'DISABLED'}")
+        print(f"  Training strategy: SEQUENTIAL on GPU (faster than multiprocessing)\n")
+    else:
+        device = "cpu"
+        n_cpu = os.cpu_count() or 1
+        print(f"\n  No GPU — using CPU ({n_cpu} cores, parallel training)\n")
+        # On CPU, AMP has no effect
+        CFG.USE_AMP = False
+
+    logger.info("Starting LEMONADE NAS on %s | device=%s | dataset=%s",
+                CFG.TARGET_DATASET, device, CFG.TARGET_DATASET)
     logger.info("Config: %s", CFG)
 
     # ------------------------------------------------------------------
@@ -310,16 +340,10 @@ def main():
     logger.info("Run directory: %s", run_dir)
 
     # ------------------------------------------------------------------
-    # Device
-    # ------------------------------------------------------------------
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Device: %s", device)
-
-    # ------------------------------------------------------------------
-    # Data loaders  (main process only — workers load their own)
+    # Data loaders for main process
     # ------------------------------------------------------------------
     from data.loader_factory import get_loaders
-    loaders = get_loaders(CFG, split_test=True)
+    loaders     = get_loaders(CFG, split_test=True)
     train_loader, val_loader = loaders[0], loaders[1]
     test_loader = loaders[2] if len(loaders) > 2 else None
 
@@ -341,33 +365,28 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Save history pickle
+    # Save history + config
     # ------------------------------------------------------------------
     history_dir = os.path.join(run_dir, "history")
     os.makedirs(history_dir, exist_ok=True)
-    history_path = os.path.join(history_dir, "history.pkl")
-    with open(history_path, "wb") as f:
+    with open(os.path.join(history_dir, "history.pkl"), "wb") as f:
         pickle.dump(history, f)
-    logger.info("History saved → %s", history_path)
-
-    # Also save config for reproducibility
-    config_path = os.path.join(run_dir, "config.pkl")
-    with open(config_path, "wb") as f:
+    with open(os.path.join(run_dir, "config.pkl"), "wb") as f:
         pickle.dump(CFG, f)
+    logger.info("History + config saved to %s", run_dir)
 
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
     plot_dir = os.path.join(run_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
-
     from utils.plot import plot_all_pairs, plot_3d_pareto, plot_convergence
     plot_all_pairs(history, cheap_objectives=CFG.CHEAP_OBJECTIVES, save_dir=plot_dir)
     plot_3d_pareto(history, save_dir=plot_dir)
     plot_convergence(history, save_dir=plot_dir)
 
     # ------------------------------------------------------------------
-    # Final test evaluation
+    # Final summary
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print(f"  LEMONADE COMPLETE — {CFG.TARGET_DATASET}")
@@ -375,35 +394,36 @@ def main():
     print("=" * 60)
 
     for i, ind in enumerate(final_population):
-        ve = ind.f_exp.get("val_error") if ind.f_exp else None
-        p  = ind.f_cheap.get("params")  if ind.f_cheap else None
-        fl = ind.f_cheap.get("flops")   if ind.f_cheap else None
+        ve = ind.f_exp.get("val_error")  if ind.f_exp   else None
+        p  = ind.f_cheap.get("params")   if ind.f_cheap else None
+        fl = ind.f_cheap.get("flops")    if ind.f_cheap else None
 
         te = None
         if test_loader is not None and ind.model is not None:
             from train.evaluate import evaluate_accuracy
             te = evaluate_accuracy(ind.model, test_loader, device=device)
 
-        logger.info(
-            "Final model %d | id=%s params=%s flops=%s "
-            "val_err=%s test_err=%s",
-            i, ind.id,
-            f"{p:,}"        if p  is not None else "?",
-            f"{int(fl):,}"  if fl is not None else "?",
-            f"{ve:.4f}"     if ve is not None else "?",
-            f"{te:.4f}"     if te is not None else "?",
-        )
-        p_str  = f"{p:>12,}"      if p  is not None else f"{'?':>12}"
+        p_str  = f"{p:>12,}"       if p  is not None else f"{'?':>12}"
         fl_str = f"{int(fl):>14,}" if fl is not None else f"{'?':>14}"
         ve_str = f"{ve:.4f}"       if ve is not None else "?"
         te_str = f"{te:.4f}"       if te is not None else "N/A"
         print(f"  [{i}] params={p_str}  flops={fl_str}  "
               f"val_err={ve_str}  test_err={te_str}")
+        logger.info("Final model %d | params=%s flops=%s val_err=%s test_err=%s",
+                    i, p_str.strip(), fl_str.strip(), ve_str, te_str)
 
     print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
+    # Colab / Linux uses "fork" by default which is fine for CPU workers.
+    # "spawn" is required on Windows and is safer if CUDA workers are ever used.
+    # We guard with try/except because set_start_method can only be called once.
+    try:
+        multiprocessing.set_start_method("spawn", force=False)
+    except RuntimeError:
+        pass  # already set — ignore
+
     main()
 
 ================================================================================
@@ -917,76 +937,91 @@ FILE:   cifar10.py
 PATH:   .\data\cifar10.py
 ################################################################################
 
-################################################################################
-# FOLDER: data
-# FILE:   cifar10.py
-# PATH:   .\data\cifar10.py
-################################################################################
-
+# data/cifar10.py
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 
-def get_cifar_loaders(batch_size=128, num_workers=0, split_test=False, fast_dev_mode=True):
-    # Light augmentation for fast NAS search (Removed heavy AutoAugment/RandomErasing)
+
+def get_cifar_loaders(batch_size=128, num_workers=0, pin_memory=False,
+                      split_test=False, fast_dev_mode=True):
+    """
+    Returns CIFAR-10 data loaders.
+
+    Parameters
+    ----------
+    num_workers  : prefetch workers (use 2 on Colab GPU, 0 on CPU-only / Windows)
+    pin_memory   : pin CPU tensors for fast GPU transfers (True when CUDA available)
+    split_test   : if True, returns (train, val, test); else (train, test)
+    fast_dev_mode: if True, uses ~10% of data for quick iteration
+    """
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(
-            (0.4914, 0.4822, 0.4465),
-            (0.2470, 0.2435, 0.2616)
-        ),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2470, 0.2435, 0.2616)),
     ])
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(
-            (0.4914, 0.4822, 0.4465),
-            (0.2470, 0.2435, 0.2616)
-        ),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2470, 0.2435, 0.2616)),
     ])
 
-    # Only pin memory in the main process to prevent Windows Worker Deadlocks
-    pin_mem = torch.cuda.is_available() and num_workers > 0
+    # persistent_workers speeds up multi-worker loaders by keeping worker
+    # processes alive between epochs instead of respawning them.
+    persistent = (num_workers > 0)
+
+    def make_loader(dataset, shuffle):
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
+            drop_last=False,
+        )
 
     if split_test:
-        train_data_full = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-        val_data_full = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_test)
-        
+        train_data_full = torchvision.datasets.CIFAR10(
+            root="./data", train=True, download=True, transform=transform_train)
+        val_data_full = torchvision.datasets.CIFAR10(
+            root="./data", train=True, download=True, transform=transform_test)
+
         indices = list(range(len(train_data_full)))
-        np.random.seed(42)  
+        np.random.seed(42)
         np.random.shuffle(indices)
-        
+
         if fast_dev_mode:
             train_idx, val_idx = indices[:4500], indices[4500:5000]
         else:
             train_idx, val_idx = indices[:45000], indices[45000:]
-            
-        train_subset = Subset(train_data_full, train_idx)
-        val_subset = Subset(val_data_full, val_idx)
-        
-        trainloader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        valloader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
+
+        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
+        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
+
+        testset     = torchvision.datasets.CIFAR10(
+            root="./data", train=False, download=True, transform=transform_test)
+        testloader  = make_loader(testset, shuffle=False)
+
         return trainloader, valloader, testloader
 
     else:
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-        
-        if fast_dev_mode:
-            num_train = len(trainset)
-            indices = list(range(num_train))
-            trainset = Subset(trainset, indices[:int(0.1 * num_train)])
+        trainset = torchvision.datasets.CIFAR10(
+            root="./data", train=True, download=True, transform=transform_train)
+        testset  = torchvision.datasets.CIFAR10(
+            root="./data", train=False, download=True, transform=transform_test)
 
-        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+        if fast_dev_mode:
+            n = len(trainset)
+            trainset = Subset(trainset, list(range(int(0.1 * n))))
+
+        trainloader = make_loader(trainset, shuffle=True)
+        testloader  = make_loader(testset,  shuffle=False)
 
         return trainloader, testloader
 
@@ -1001,77 +1036,89 @@ FILE:   cifar100.py
 PATH:   .\data\cifar100.py
 ################################################################################
 
-################################################################################
-# FOLDER: data
-# FILE:   cifar100.py
-# PATH:   .\data\cifar100.py
-################################################################################
-
+# data/cifar100.py
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 
-def get_cifar100_loaders(batch_size=128, num_workers=0, split_test=False, fast_dev_mode=True):
-    # Light augmentation for fast NAS search
-    # CIFAR-100 specific mean and std normalization values
+
+def get_cifar100_loaders(batch_size=128, num_workers=0, pin_memory=False,
+                         split_test=False, fast_dev_mode=True):
+    """
+    Returns CIFAR-100 data loaders.
+
+    Parameters
+    ----------
+    num_workers  : prefetch workers (use 2 on Colab GPU, 0 on CPU-only / Windows)
+    pin_memory   : pin CPU tensors for fast GPU transfers (True when CUDA available)
+    split_test   : if True, returns (train, val, test); else (train, test)
+    fast_dev_mode: if True, uses ~10% of data for quick iteration
+    """
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(
-            (0.5071, 0.4865, 0.4409),
-            (0.2673, 0.2564, 0.2762)
-        ),
+        transforms.Normalize((0.5071, 0.4865, 0.4409),
+                             (0.2673, 0.2564, 0.2762)),
     ])
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(
-            (0.5071, 0.4865, 0.4409),
-            (0.2673, 0.2564, 0.2762)
-        ),
+        transforms.Normalize((0.5071, 0.4865, 0.4409),
+                             (0.2673, 0.2564, 0.2762)),
     ])
 
-    # Only pin memory in the main process to prevent Windows Worker Deadlocks
-    pin_mem = torch.cuda.is_available() and num_workers > 0
+    persistent = (num_workers > 0)
+
+    def make_loader(dataset, shuffle):
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
+            drop_last=False,
+        )
 
     if split_test:
-        train_data_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
-        val_data_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_test)
-        
+        train_data_full = torchvision.datasets.CIFAR100(
+            root="./data", train=True, download=True, transform=transform_train)
+        val_data_full = torchvision.datasets.CIFAR100(
+            root="./data", train=True, download=True, transform=transform_test)
+
         indices = list(range(len(train_data_full)))
-        np.random.seed(42)  
+        np.random.seed(42)
         np.random.shuffle(indices)
-        
+
         if fast_dev_mode:
             train_idx, val_idx = indices[:4500], indices[4500:5000]
         else:
             train_idx, val_idx = indices[:45000], indices[45000:]
-            
-        train_subset = Subset(train_data_full, train_idx)
-        val_subset = Subset(val_data_full, val_idx)
-        
-        trainloader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        valloader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
-        testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
+
+        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
+        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
+
+        testset    = torchvision.datasets.CIFAR100(
+            root="./data", train=False, download=True, transform=transform_test)
+        testloader = make_loader(testset, shuffle=False)
+
         return trainloader, valloader, testloader
 
     else:
-        trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
-        
-        if fast_dev_mode:
-            num_train = len(trainset)
-            indices = list(range(num_train))
-            trainset = Subset(trainset, indices[:int(0.1 * num_train)])
+        trainset = torchvision.datasets.CIFAR100(
+            root="./data", train=True, download=True, transform=transform_train)
+        testset  = torchvision.datasets.CIFAR100(
+            root="./data", train=False, download=True, transform=transform_test)
 
-        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+        if fast_dev_mode:
+            n = len(trainset)
+            trainset = Subset(trainset, list(range(int(0.1 * n))))
+
+        trainloader = make_loader(trainset, shuffle=True)
+        testloader  = make_loader(testset,  shuffle=False)
 
         return trainloader, testloader
 
@@ -1086,12 +1133,7 @@ FILE:   imagenet.py
 PATH:   .\data\imagenet.py
 ################################################################################
 
-################################################################################
-# FOLDER: data
-# FILE:   imagenet.py
-# PATH:   .\data\imagenet.py
-################################################################################
-
+# data/imagenet.py
 import os
 import torch
 import torchvision
@@ -1102,74 +1144,98 @@ from utils.logger import get_logger
 
 logger = get_logger("imagenet_loader", logfile="logs/imagenet.log")
 
-def get_imagenet_loaders(batch_size=32, num_workers=0, split_test=False, fast_dev_mode=True):
-    # ImageNet requires 224x224 input sizes and specific normalization
+
+def get_imagenet_loaders(batch_size=32, num_workers=0, pin_memory=False,
+                         split_test=False, fast_dev_mode=True):
+    """
+    Returns ImageNet data loaders.
+
+    Parameters
+    ----------
+    num_workers  : prefetch workers
+    pin_memory   : pin CPU tensors for fast GPU transfers
+    split_test   : if True, returns (train, val, test); else (train, test)
+    fast_dev_mode: if True, uses a small subset
+    """
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
 
     transform_test = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
 
-    pin_mem = torch.cuda.is_available() and num_workers > 0
-    data_dir = './data/imagenet'
-    
-    # FALLBACK: If ImageNet is not downloaded (it is 150GB), use FakeData to test the pipeline safely
-    use_fake_data = not os.path.exists(os.path.join(data_dir, 'train'))
+    data_dir     = "./data/imagenet"
+    use_fake_data = not os.path.exists(os.path.join(data_dir, "train"))
     if use_fake_data:
-        logger.warning("Real ImageNet files not found in ./data/imagenet/train. Using FakeData for architecture testing.")
-        dataset_class = lambda is_train, transform: torchvision.datasets.FakeData(
-            size=5000 if is_train else 1000, image_size=(3, 224, 224), num_classes=1000, transform=transform
-        )
+        logger.warning("ImageNet not found at %s — using FakeData.", data_dir)
+        def dataset_class(is_train, transform):
+            return torchvision.datasets.FakeData(
+                size=5000 if is_train else 1000,
+                image_size=(3, 224, 224),
+                num_classes=1000,
+                transform=transform,
+            )
     else:
-        dataset_class = lambda is_train, transform: torchvision.datasets.ImageFolder(
-            root=os.path.join(data_dir, 'train' if is_train else 'val'), transform=transform
+        def dataset_class(is_train, transform):
+            return torchvision.datasets.ImageFolder(
+                root=os.path.join(data_dir, "train" if is_train else "val"),
+                transform=transform,
+            )
+
+    persistent = (num_workers > 0)
+
+    def make_loader(dataset, shuffle):
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
+            drop_last=False,
         )
 
     if split_test:
-        train_data_full = dataset_class(is_train=True, transform=transform_train)
-        val_data_full = dataset_class(is_train=True, transform=transform_test)
-        
+        train_data_full = dataset_class(is_train=True,  transform=transform_train)
+        val_data_full   = dataset_class(is_train=True,  transform=transform_test)
+
         indices = list(range(len(train_data_full)))
-        np.random.seed(42)  
+        np.random.seed(42)
         np.random.shuffle(indices)
-        
+
         if fast_dev_mode:
             train_idx, val_idx = indices[:1000], indices[1000:1200]
         else:
-            # Standard 90/10 split of training data if real ImageNet
             split = int(0.9 * len(indices))
             train_idx, val_idx = indices[:split], indices[split:]
-            
-        train_subset = Subset(train_data_full, train_idx)
-        val_subset = Subset(val_data_full, val_idx)
-        
-        trainloader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        valloader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
-        testset = dataset_class(is_train=False, transform=transform_test)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
-        
+
+        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
+        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
+
+        testset    = dataset_class(is_train=False, transform=transform_test)
+        testloader = make_loader(testset, shuffle=False)
+
         return trainloader, valloader, testloader
 
     else:
-        trainset = dataset_class(is_train=True, transform=transform_train)
-        testset = dataset_class(is_train=False, transform=transform_test)
-        
-        if fast_dev_mode:
-            num_train = len(trainset)
-            indices = list(range(num_train))
-            trainset = Subset(trainset, indices[:int(0.1 * num_train)])
+        trainset = dataset_class(is_train=True,  transform=transform_train)
+        testset  = dataset_class(is_train=False, transform=transform_test)
 
-        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
-        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+        if fast_dev_mode:
+            n = len(trainset)
+            trainset = Subset(trainset, list(range(int(0.1 * n))))
+
+        trainloader = make_loader(trainset, shuffle=True)
+        testloader  = make_loader(testset,  shuffle=False)
 
         return trainloader, testloader
 
@@ -1186,39 +1252,80 @@ PATH:   .\data\loader_factory.py
 
 # data/loader_factory.py
 # =============================================================================
-# Single entry-point for data loading, used by BOTH the main process and
-# worker sub-processes.  Fixes the bug where workers always loaded CIFAR-10
-# regardless of TARGET_DATASET.
+# Single entry-point for data loading.
+#
+# get_loaders(cfg)           — main process: uses cfg.NUM_DATALOADER_WORKERS
+#                              and cfg.PIN_MEMORY for fast GPU data feeds.
+#
+# get_loaders_for_worker(cfg) — CPU subprocess workers: always num_workers=0
+#                               and pin_memory=False (nested MP is unsafe).
 # =============================================================================
+import torch
 
 
 def get_loaders(cfg, split_test: bool = True):
-    """Return (train_loader, val_loader[, test_loader]) based on cfg."""
-    ds = cfg.TARGET_DATASET
-    bs = cfg.BATCH_SIZE
+    """
+    Return (train_loader, val_loader[, test_loader]) for the main process.
+
+    Uses cfg.NUM_DATALOADER_WORKERS prefetch workers and cfg.PIN_MEMORY for
+    fast CPU→GPU data transfers when CUDA is available.
+    """
+    ds  = cfg.TARGET_DATASET
+    bs  = cfg.BATCH_SIZE
     fdm = cfg.FAST_DEV_MODE
+
+    # pin_memory is only useful when CUDA is available
+    pin = cfg.PIN_MEMORY and torch.cuda.is_available()
+    nw  = cfg.NUM_DATALOADER_WORKERS if torch.cuda.is_available() else 0
 
     if ds == "CIFAR-100":
         from data.cifar100 import get_cifar100_loaders
-        return get_cifar100_loaders(batch_size=bs, num_workers=0,
-                                    split_test=split_test, fast_dev_mode=fdm)
+        return get_cifar100_loaders(
+            batch_size=bs, num_workers=nw, pin_memory=pin,
+            split_test=split_test, fast_dev_mode=fdm,
+        )
     elif ds == "IMAGENET":
         from data.imagenet import get_imagenet_loaders
-        return get_imagenet_loaders(batch_size=bs, num_workers=0,
-                                    split_test=split_test, fast_dev_mode=fdm)
+        return get_imagenet_loaders(
+            batch_size=bs, num_workers=nw, pin_memory=pin,
+            split_test=split_test, fast_dev_mode=fdm,
+        )
     else:  # default: CIFAR-10
         from data.cifar10 import get_cifar_loaders
-        return get_cifar_loaders(batch_size=bs, num_workers=0,
-                                 split_test=split_test, fast_dev_mode=fdm)
+        return get_cifar_loaders(
+            batch_size=bs, num_workers=nw, pin_memory=pin,
+            split_test=split_test, fast_dev_mode=fdm,
+        )
 
 
 def get_loaders_for_worker(cfg):
     """
-    Convenience wrapper that returns only (train_loader, val_loader).
-    Workers always use num_workers=0 to avoid nested multiprocessing.
+    Returns (train_loader, val_loader) for use inside a CPU subprocess worker.
+    Always uses num_workers=0 and pin_memory=False to avoid nested-MP crashes.
     """
-    result = get_loaders(cfg, split_test=True)
-    # result is (train, val, test) or (train, val)
+    ds  = cfg.TARGET_DATASET
+    bs  = cfg.BATCH_SIZE
+    fdm = cfg.FAST_DEV_MODE
+
+    if ds == "CIFAR-100":
+        from data.cifar100 import get_cifar100_loaders
+        result = get_cifar100_loaders(
+            batch_size=bs, num_workers=0, pin_memory=False,
+            split_test=True, fast_dev_mode=fdm,
+        )
+    elif ds == "IMAGENET":
+        from data.imagenet import get_imagenet_loaders
+        result = get_imagenet_loaders(
+            batch_size=bs, num_workers=0, pin_memory=False,
+            split_test=True, fast_dev_mode=fdm,
+        )
+    else:
+        from data.cifar10 import get_cifar_loaders
+        result = get_cifar_loaders(
+            batch_size=bs, num_workers=0, pin_memory=False,
+            split_test=True, fast_dev_mode=fdm,
+        )
+    # result is (train, val, test) — we only need train and val
     return result[0], result[1]
 
 ================================================================================
@@ -1349,25 +1456,25 @@ PATH:   .\evolution\lemonade_full.py
 
 # evolution/lemonade_full.py
 # =============================================================================
-# CORRECT LEMONADE LOOP ORDER (per Algorithm 1 in the paper):
+# LEMONADE loop — GPU/CPU adaptive execution.
 #
-#   Gen 0:
-#     1. Train seed population (INIT_EPOCHS) in parallel
-#     2. Compute initial Pareto front
+# GPU strategy (CUDA available):
+#   Models are trained ONE AT A TIME on the GPU in the main process.
+#   ┌─────────────────────────────────────────────────────────┐
+#   │  Why sequential on GPU beats parallel on CPU:           │
+#   │  • A single GPU forward/backward is 20-100x faster      │
+#   │    than a CPU pass — no parallelism needed.             │
+#   │  • No pickle/IPC overhead (models stay in main proc).   │
+#   │  • Dataset is loaded ONCE per generation, not once       │
+#   │    per model per worker.                                 │
+#   │  • CUDA cannot be forked to child processes safely.      │
+#   └─────────────────────────────────────────────────────────┘
 #
-#   Gen 1 .. GENERATIONS:
-#     1. KDE fit on population's CHEAP objectives
-#     2. Sample npc PARENTS  (inverse density → fill sparse regions)
-#     3. Apply ONE operator per parent → npc candidate CHILDREN (no training)
-#     4. Evaluate CHEAP objectives on all npc candidates  (free)
-#     5. KDE filter: sample nac accepted children from candidates (inverse density)
-#        → only nac children enter the expensive training phase
-#     6. TRAIN accepted children (in parallel):
-#           ANM children: distill(DISTILL_EPOCHS) → train(CHILD_EPOCHS)
-#           NM  children: train(CHILD_EPOCHS) only
-#     7. Merge into population → compute new Pareto front
-#     8. Fill to MIN_POP using diversity-maximising selection if needed
-#     9. Save history + model weights
+# CPU strategy (no CUDA):
+#   Models are trained IN PARALLEL using ProcessPoolExecutor
+#   (same as before, one worker per CPU core).
+#
+# The loop logic (correct LEMONADE Algorithm 1 order) is unchanged.
 # =============================================================================
 
 import os
@@ -1389,45 +1496,40 @@ error_logger = get_logger("lemonade_errors", logfile="logs/lemonade_errors.log")
 
 
 # =============================================================================
-# Worker function  (runs in a separate subprocess)
+# GPU path — train one child at a time in the main process
 # =============================================================================
 
-def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
-                        train_lr: float):
+def _train_one_child_gpu(pc, cfg, train_epochs, train_lr,
+                         device, train_loader, val_loader):
     """
-    Complete child lifecycle inside one worker process:
-      load graph → build model ONCE → load inherited weights →
-      [distill if ANM] → standard training → evaluate → return.
+    Train a single child on the GPU (main process, no pickling).
 
-    Notes
-    -----
-    * The model is built exactly ONCE.  Distillation and training operate on
-      the SAME nn.Module object so inherited weights are never discarded.
-    * child.model is cleared before pickling (nn.Module is not safely
-      picklable); the trained state dict is written to a temp file instead.
-    * No artificial sleep().  No hardcoded dataset.
+    Parameters
+    ----------
+    pc           : bytes — pickled payload tuple
+    cfg          : NASConfig
+    train_epochs : int
+    train_lr     : float
+    device       : "cuda" or "cuda:N"
+    train_loader : DataLoader — shared across all children this generation
+    val_loader   : DataLoader — shared across all children this generation
+
+    Returns
+    -------
+    dict with keys: status, ind (Individual), error
     """
-    import os, gc, pickle, time, traceback
     import torch
-
-    # Silence tqdm in sub-processes unconditionally — avoid pipe crashes
-    os.environ["TQDM_DISABLE"] = "1"
-    torch.set_num_threads(1)
+    from objectives.cheap import clean_state_dict
 
     try:
-        start = time.time()
-
         child_graph, child_sd_path, parent_graph, parent_sd_path, is_approx = \
-            pickle.loads(pickled_payload)
-
-        from objectives.cheap import clean_state_dict
+            pickle.loads(pc)
 
         # ------------------------------------------------------------------
-        # 1. Build child model ONCE
+        # 1. Build child model ONCE (stays in main process — no CUDA fork)
         # ------------------------------------------------------------------
-        from evolution.individual import Individual as _Ind
-        child       = _Ind(child_graph)
-        child_model = child.build_model()      # child.model is now set
+        child       = Individual(child_graph)
+        child_model = child.build_model()
 
         # ------------------------------------------------------------------
         # 2. Load Lamarckian inherited weights
@@ -1437,8 +1539,8 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
                 sd = torch.load(child_sd_path, map_location="cpu",
                                 weights_only=True)
                 child_model.load_state_dict(clean_state_dict(sd), strict=False)
-            except Exception as e:
-                pass   # proceed with random init — better than crashing
+            except Exception:
+                pass  # random init is fine
             finally:
                 try:
                     os.remove(child_sd_path)
@@ -1446,12 +1548,12 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
                     pass
 
         # ------------------------------------------------------------------
-        # 3. Build teacher model if ANM
+        # 3. Build teacher if ANM child (for distillation)
         # ------------------------------------------------------------------
         teacher_model = None
         if is_approx and parent_graph is not None:
             try:
-                teacher = _Ind(parent_graph)
+                teacher       = Individual(parent_graph)
                 teacher_model = teacher.build_model()
                 if parent_sd_path and os.path.exists(parent_sd_path):
                     sd = torch.load(parent_sd_path, map_location="cpu",
@@ -1461,98 +1563,268 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
                 teacher_model.eval()
                 for p in teacher_model.parameters():
                     p.requires_grad = False
-            except Exception as e:
-                teacher_model = None  # distillation is optional; don't crash
+            except Exception:
+                teacher_model = None
 
         # ------------------------------------------------------------------
-        # 4. Evaluate cheap objectives  (fast — uses existing child.model)
+        # 4. Evaluate cheap objectives (graph-based, no GPU needed)
         # ------------------------------------------------------------------
         try:
             child.evaluate_cheap(
                 objective_keys=cfg.CHEAP_OBJECTIVES,
                 input_size=(1, 3, 32, 32),
             )
-        except Exception as e:
+        except Exception:
             child.f_cheap = {k: 0 for k in cfg.CHEAP_OBJECTIVES}
 
         # ------------------------------------------------------------------
-        # 5. Load dataset (correct dataset based on cfg)
-        # ------------------------------------------------------------------
-        from data.loader_factory import get_loaders_for_worker
-        train_loader_w, val_loader_w = get_loaders_for_worker(cfg)
-
-        device = "cpu"  # workers always run on CPU (avoids CUDA fork issues)
-
-        # ------------------------------------------------------------------
-        # 6a. Distillation phase  (ANM only, DISTILL_EPOCHS, DISTILL_LR)
-        #     Operates on child_model directly — NO new model build
+        # 5a. Distillation phase (ANM only)
+        #     Use DISTILL_EPOCHS + DISTILL_LR — separate from training.
         # ------------------------------------------------------------------
         if is_approx and teacher_model is not None:
             try:
                 from train.distill import train_with_distillation
                 train_with_distillation(
-                    student_model=child_model,
-                    teacher_model=teacher_model,
-                    train_loader=train_loader_w,
-                    device=device,
-                    epochs=cfg.DISTILL_EPOCHS,
-                    lr=cfg.DISTILL_LR,
-                    temperature=cfg.DISTILL_TEMPERATURE,
-                    alpha=cfg.DISTILL_ALPHA,
-                    weight_decay=cfg.WEIGHT_DECAY,
-                    optimizer_name=cfg.OPTIMIZER,
-                    show_progress=False,        # always off in workers
+                    student_model  = child_model,
+                    teacher_model  = teacher_model,
+                    train_loader   = train_loader,
+                    device         = device,
+                    epochs         = cfg.DISTILL_EPOCHS,
+                    lr             = cfg.DISTILL_LR,
+                    temperature    = cfg.DISTILL_TEMPERATURE,
+                    alpha          = cfg.DISTILL_ALPHA,
+                    weight_decay   = cfg.WEIGHT_DECAY,
+                    optimizer_name = cfg.OPTIMIZER,
+                    show_progress  = False,   # no nested bars
+                    use_amp        = cfg.USE_AMP,
                 )
             except Exception as e:
-                error_logger.error("Distillation failed for %s: %s",
-                                   child.id, e)
+                error_logger.error("Distillation failed %s: %s", child.id, e)
             finally:
+                # Free teacher from GPU immediately after distillation
+                teacher_model.cpu()
                 del teacher_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 gc.collect()
 
         # ------------------------------------------------------------------
-        # 6b. Standard training phase  (all children, train_epochs, train_lr)
-        #     Operates on child_model directly
+        # 5b. Standard training (all children)
         # ------------------------------------------------------------------
         try:
             from train.trainer import train_model
             train_model(
-                model=child_model,
-                train_loader=train_loader_w,
-                device=device,
-                epochs=train_epochs,
-                lr=train_lr,
-                weight_decay=cfg.WEIGHT_DECAY,
-                optimizer_name=cfg.OPTIMIZER,
-                show_progress=False,
+                model          = child_model,
+                train_loader   = train_loader,
+                device         = device,
+                epochs         = train_epochs,
+                lr             = train_lr,
+                weight_decay   = cfg.WEIGHT_DECAY,
+                optimizer_name = cfg.OPTIMIZER,
+                show_progress  = False,
+                use_amp        = cfg.USE_AMP,
             )
         except Exception as e:
-            error_logger.error("Training failed for %s: %s", child.id, e)
+            error_logger.error("Training failed %s: %s", child.id, e)
 
         # ------------------------------------------------------------------
-        # 7. Evaluate accuracy  (uses child_model — same object)
+        # 6. Evaluate (AMP inference)
         # ------------------------------------------------------------------
         try:
             from train.evaluate import evaluate_accuracy
-            val_error = evaluate_accuracy(child_model, val_loader_w,
-                                          device=device)
-        except Exception as e:
-            val_error = 1.0   # worst case; model still enters Pareto candidate pool
+            val_error = evaluate_accuracy(child_model, val_loader,
+                                          device=device,
+                                          use_amp=cfg.USE_AMP)
+        except Exception:
+            val_error = 1.0
 
         child.f_exp = {"val_error": val_error}
 
         # ------------------------------------------------------------------
-        # 8. Persist trained weights to disk
+        # 7. Move model back to CPU to free GPU memory for the next child
         # ------------------------------------------------------------------
-        trained_sd_path = os.path.join(
-            tempfile.gettempdir(),
-            f"nas_trained_{child.id}_{int(time.time() * 1000)}.pt",
-        )
-        torch.save(child_model.state_dict(), trained_sd_path)
+        child_model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
-        # ------------------------------------------------------------------
-        # 9. Clear model before pickling (nn.Module is not picklable)
-        # ------------------------------------------------------------------
+        return {"status": "ok", "ind": child}
+
+    except Exception as exc:
+        return {
+            "status":    "error",
+            "error":     str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+
+def _sequential_train_gpu(payloads, cfg, train_epochs, train_lr,
+                           device, desc):
+    """
+    Train each child sequentially on the GPU.
+    Data loaders are created ONCE and shared across all children.
+    """
+    import torch
+    from data.loader_factory import get_loaders
+
+    # Create data loaders once for the whole batch
+    # Use full num_workers + pin_memory for GPU
+    loaders      = get_loaders(cfg, split_test=True)
+    train_loader = loaders[0]
+    val_loader   = loaders[1]
+
+    trained = []
+    n       = len(payloads)
+
+    if cfg.SHOW_PROGRESS_BAR:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(enumerate(payloads), total=n,
+                            desc=desc, unit="model")
+        except ImportError:
+            iterator = enumerate(payloads)
+    else:
+        iterator = enumerate(payloads)
+
+    for i, (idx, pc) in iterator:
+        result = _train_one_child_gpu(
+            pc, cfg, train_epochs, train_lr,
+            device, train_loader, val_loader,
+        )
+        if result["status"] == "ok":
+            trained.append(result["ind"])
+        else:
+            error_logger.error("%s child %d/%d error: %s\n%s",
+                               desc, i + 1, n,
+                               result.get("error"),
+                               result.get("traceback", ""))
+
+    return trained
+
+
+# =============================================================================
+# CPU path — parallel training via ProcessPoolExecutor (unchanged from before)
+# =============================================================================
+
+def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
+    """
+    Worker function for CPU-parallel training.
+    Runs in a subprocess — must not use CUDA.
+    """
+    import os, gc, pickle, time, traceback
+    import torch
+
+    os.environ["TQDM_DISABLE"] = "1"
+    torch.set_num_threads(1)
+
+    try:
+        start = time.time()
+        child_graph, child_sd_path, parent_graph, parent_sd_path, is_approx = \
+            pickle.loads(pickled_payload)
+
+        from objectives.cheap import clean_state_dict
+        from evolution.individual import Individual as _Ind
+
+        child       = _Ind(child_graph)
+        child_model = child.build_model()
+
+        if child_sd_path and os.path.exists(child_sd_path):
+            try:
+                sd = torch.load(child_sd_path, map_location="cpu",
+                                weights_only=True)
+                child_model.load_state_dict(clean_state_dict(sd), strict=False)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(child_sd_path)
+                except OSError:
+                    pass
+
+        teacher_model = None
+        if is_approx and parent_graph is not None:
+            try:
+                teacher       = _Ind(parent_graph)
+                teacher_model = teacher.build_model()
+                if parent_sd_path and os.path.exists(parent_sd_path):
+                    sd = torch.load(parent_sd_path, map_location="cpu",
+                                    weights_only=True)
+                    teacher_model.load_state_dict(clean_state_dict(sd),
+                                                  strict=False)
+                teacher_model.eval()
+                for p in teacher_model.parameters():
+                    p.requires_grad = False
+            except Exception:
+                teacher_model = None
+
+        try:
+            child.evaluate_cheap(
+                objective_keys=cfg.CHEAP_OBJECTIVES,
+                input_size=(1, 3, 32, 32),
+            )
+        except Exception:
+            child.f_cheap = {k: 0 for k in cfg.CHEAP_OBJECTIVES}
+
+        from data.loader_factory import get_loaders_for_worker
+        train_loader_w, val_loader_w = get_loaders_for_worker(cfg)
+
+        device = "cpu"  # workers MUST use CPU
+
+        if is_approx and teacher_model is not None:
+            try:
+                from train.distill import train_with_distillation
+                train_with_distillation(
+                    student_model  = child_model,
+                    teacher_model  = teacher_model,
+                    train_loader   = train_loader_w,
+                    device         = device,
+                    epochs         = cfg.DISTILL_EPOCHS,
+                    lr             = cfg.DISTILL_LR,
+                    temperature    = cfg.DISTILL_TEMPERATURE,
+                    alpha          = cfg.DISTILL_ALPHA,
+                    weight_decay   = cfg.WEIGHT_DECAY,
+                    optimizer_name = cfg.OPTIMIZER,
+                    show_progress  = False,
+                    use_amp        = False,  # no AMP on CPU
+                )
+            except Exception as e:
+                error_logger.error("Distillation failed %s: %s", child.id, e)
+            finally:
+                del teacher_model
+                gc.collect()
+
+        try:
+            from train.trainer import train_model
+            train_model(
+                model          = child_model,
+                train_loader   = train_loader_w,
+                device         = device,
+                epochs         = train_epochs,
+                lr             = train_lr,
+                weight_decay   = cfg.WEIGHT_DECAY,
+                optimizer_name = cfg.OPTIMIZER,
+                show_progress  = False,
+                use_amp        = False,
+            )
+        except Exception as e:
+            error_logger.error("Training failed %s: %s", child.id, e)
+
+        try:
+            from train.evaluate import evaluate_accuracy
+            val_error = evaluate_accuracy(child_model, val_loader_w,
+                                          device=device, use_amp=False)
+        except Exception:
+            val_error = 1.0
+
+        child.f_exp = {"val_error": val_error}
+
+        # Save trained weights to disk for IPC back to main process
+        sd_path = os.path.join(
+            tempfile.gettempdir(),
+            f"nas_cpu_{child.id}_{int(time.time() * 1000)}.pt",
+        )
+        torch.save(child_model.state_dict(), sd_path)
+
         child.model = None
         del child_model
         gc.collect()
@@ -1561,7 +1833,7 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
             "idx":             idx,
             "status":          "ok",
             "pickled_child":   pickle.dumps(child),
-            "trained_sd_path": trained_sd_path,
+            "trained_sd_path": sd_path,
             "duration":        time.time() - start,
         }
 
@@ -1574,17 +1846,12 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
         }
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-def _parallel_train(payloads, cfg, train_epochs, train_lr, desc):
+def _parallel_train_cpu(payloads, cfg, train_epochs, train_lr, desc):
     """
-    Submit payloads to a process pool and collect trained Individuals.
-    Returns list of Individual objects with model weights loaded.
+    Train children in parallel on CPU cores (used when no GPU is available).
     """
     import torch
-    cpu_count  = max(1, (os.cpu_count() or 2) - 1)
+    cpu_count   = max(1, (os.cpu_count() or 2) - 1)
     max_workers = min(cpu_count, len(payloads))
 
     trained = []
@@ -1615,17 +1882,15 @@ def _parallel_train(payloads, cfg, train_epochs, train_lr, desc):
 
             if result.get("status") != "ok":
                 error_logger.error("%s worker error [idx=%s]: %s\n%s",
-                                   desc,
-                                   result.get("idx"),
+                                   desc, result.get("idx"),
                                    result.get("error"),
                                    result.get("traceback", ""))
                 continue
 
             try:
-                ind = pickle.loads(result["pickled_child"])
+                ind     = pickle.loads(result["pickled_child"])
                 sd_path = result.get("trained_sd_path")
                 if sd_path and os.path.exists(sd_path):
-                    # Build model fresh in main process then load trained weights
                     model = ind.build_model()
                     model.load_state_dict(
                         torch.load(sd_path, map_location="cpu",
@@ -1638,16 +1903,75 @@ def _parallel_train(payloads, cfg, train_epochs, train_lr, desc):
                         pass
                 trained.append(ind)
             except Exception as e:
-                error_logger.error("Failed to deserialise trained child: %s", e)
+                error_logger.error("Deserialise error: %s", e)
 
     return trained
 
 
+# =============================================================================
+# Unified dispatcher — chooses GPU or CPU path automatically
+# =============================================================================
+
+def _train_all(payloads, cfg, train_epochs, train_lr, desc, device):
+    """
+    Route to GPU-sequential or CPU-parallel training based on device.
+    """
+    if device.startswith("cuda"):
+        return _sequential_train_gpu(
+            payloads, cfg, train_epochs, train_lr, device, desc
+        )
+    else:
+        return _parallel_train_cpu(
+            payloads, cfg, train_epochs, train_lr, desc
+        )
+
+
+# =============================================================================
+# Shared helpers
+# =============================================================================
+
+def _build_payloads(items, temp_dir, gen):
+    """
+    Serialise (child, parent, is_approx) triples into pickled payloads.
+    Returns (payloads, paths_to_clean_later).
+    """
+    import torch
+    payloads          = []
+    parent_temp_paths = []
+
+    for idx, (child, parent, approx) in enumerate(items):
+        try:
+            child_sd_path  = None
+            parent_sd_path = None
+
+            if child.model is not None:
+                child_sd_path = os.path.join(
+                    temp_dir, f"child_{child.id}_{gen}.pt"
+                )
+                torch.save(child.model.state_dict(), child_sd_path)
+
+            if parent is not None and parent.model is not None:
+                parent_sd_path = os.path.join(
+                    temp_dir, f"parent_{parent.id}_for_{child.id}_{gen}.pt"
+                )
+                torch.save(parent.model.state_dict(), parent_sd_path)
+                parent_temp_paths.append(parent_sd_path)
+
+            pc = pickle.dumps((
+                child.graph, child_sd_path,
+                parent.graph if parent is not None else None,
+                parent_sd_path,
+                approx,
+            ))
+            payloads.append((idx, pc))
+
+        except Exception as e:
+            error_logger.error("Serialise error for child %s: %s", child.id, e)
+
+    return payloads, parent_temp_paths
+
+
 def _save_generation_models(population, gen, models_dir):
-    """
-    Save model weights and graph metadata for every individual in population.
-    Returns a list of dicts (the history entry for this generation).
-    """
     import torch
     gen_dir = os.path.join(models_dir, f"gen_{gen:03d}")
     os.makedirs(gen_dir, exist_ok=True)
@@ -1655,14 +1979,13 @@ def _save_generation_models(population, gen, models_dir):
     history_entry = []
     for ind in population:
         record = {
-            "id":        ind.id,
-            "params":    ind.f_cheap.get("params") if ind.f_cheap else None,
-            "flops":     ind.f_cheap.get("flops")  if ind.f_cheap else None,
-            "val_error": ind.f_exp.get("val_error") if ind.f_exp   else None,
+            "id":         ind.id,
+            "params":     ind.f_cheap.get("params")    if ind.f_cheap else None,
+            "flops":      ind.f_cheap.get("flops")     if ind.f_cheap else None,
+            "val_error":  ind.f_exp.get("val_error")   if ind.f_exp   else None,
             "model_path": None,
             "graph_path": None,
         }
-        # Save weights if model is built
         if ind.model is not None:
             try:
                 wpath = os.path.join(gen_dir, f"{ind.id}_weights.pt")
@@ -1670,7 +1993,6 @@ def _save_generation_models(population, gen, models_dir):
                 record["model_path"] = wpath
             except Exception:
                 pass
-        # Save graph (lightweight pickle)
         try:
             gpath = os.path.join(gen_dir, f"{ind.id}_graph.pkl")
             with open(gpath, "wb") as f:
@@ -1678,7 +2000,6 @@ def _save_generation_models(population, gen, models_dir):
             record["graph_path"] = gpath
         except Exception:
             pass
-
         history_entry.append(record)
 
     return history_entry
@@ -1687,19 +2008,21 @@ def _save_generation_models(population, gen, models_dir):
 def _print_summary(gen, population):
     rows = []
     for ind in population:
-        p = ind.f_cheap.get("params") if ind.f_cheap else None
-        f = ind.f_cheap.get("flops")  if ind.f_cheap else None
-        v = ind.f_exp.get("val_error") if ind.f_exp   else None
+        p = ind.f_cheap.get("params")    if ind.f_cheap else None
+        f = ind.f_cheap.get("flops")     if ind.f_cheap else None
+        v = ind.f_exp.get("val_error")   if ind.f_exp   else None
         rows.append((p, f, v))
-    rows.sort(key=lambda r: (r[2] if r[2] is not None else 1.0,
-                             r[0] if r[0] is not None else float("inf")))
+    rows.sort(key=lambda r: (
+        r[2] if r[2] is not None else 1.0,
+        r[0] if r[0] is not None else float("inf"),
+    ))
     print(f"\n{'='*65}")
     print(f"  Generation {gen}  |  Pareto population: {len(rows)} models")
     print(f"  {'params':>10}  {'flops':>12}  {'val_error':>10}")
     for p, f, v in rows[:8]:
-        ps = f"{p:>10,}" if p is not None else f"{'?':>10}"
+        ps = f"{p:>10,}"      if p is not None else f"{'?':>10}"
         fs = f"{int(f):>12,}" if f is not None else f"{'?':>12}"
-        vs = f"{v:.4f}" if v is not None else "?"
+        vs = f"{v:.4f}"       if v is not None else "?"
         print(f"  {ps}  {fs}  {vs:>10}")
     print(f"{'='*65}\n")
 
@@ -1710,16 +2033,17 @@ def _print_summary(gen, population):
 
 def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     """
-    Run the LEMONADE algorithm.
+    Run the LEMONADE NAS algorithm.
 
     Parameters
     ----------
-    init_graphs  : list[ArchitectureGraph]  — seed architectures
+    init_graphs  : list[ArchitectureGraph]
     cfg          : NASConfig
-    train_loader : DataLoader (main process only; workers load their own)
-    val_loader   : DataLoader (main process only)
-    device       : "cpu" or "cuda"
-    run_dir      : str — root output directory for this experiment
+    train_loader : DataLoader (main process — GPU path ignores this internally,
+                   creates its own with proper settings per generation)
+    val_loader   : DataLoader
+    device       : "cpu" | "cuda" | "cuda:N"
+    run_dir      : output directory
 
     Returns
     -------
@@ -1727,24 +2051,26 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     """
     import torch
 
+    use_gpu = device.startswith("cuda") and torch.cuda.is_available()
     logger.info(
         "LEMONADE start: gens=%d N_pc=%d N_ac=%d "
-        "init_ep=%d child_ep=%d distill_ep=%d device=%s",
+        "init_ep=%d child_ep=%d distill_ep=%d "
+        "device=%s amp=%s",
         cfg.GENERATIONS, cfg.N_CHILDREN, cfg.N_ACCEPT,
-        cfg.INIT_EPOCHS, cfg.CHILD_EPOCHS, cfg.DISTILL_EPOCHS, device,
+        cfg.INIT_EPOCHS, cfg.CHILD_EPOCHS, cfg.DISTILL_EPOCHS,
+        device, cfg.USE_AMP and use_gpu,
     )
 
     models_dir = os.path.join(run_dir, "models")
     os.makedirs(models_dir, exist_ok=True)
-    temp_dir   = tempfile.gettempdir()
-    history    = {}
-    sampler    = KDESampler(base_bandwidth=cfg.KDE_BANDWIDTH)
+    temp_dir = tempfile.gettempdir()
+    history  = {}
+    sampler  = KDESampler(base_bandwidth=cfg.KDE_BANDWIDTH)
 
     # ------------------------------------------------------------------
-    # Initialise population
+    # Initialise population with cheap objectives
     # ------------------------------------------------------------------
     population = [Individual(g) for g in init_graphs]
-
     for ind in population:
         try:
             ind.evaluate_cheap(
@@ -1759,28 +2085,28 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     # Generation 0 — train seed population
     # ------------------------------------------------------------------
     logger.info("=== Generation 0: Training %d seed models ===", len(population))
-    payloads_g0 = []
-    for idx, ind in enumerate(population):
-        try:
-            if ind.model is None:
-                ind.build_model()
-            sd_path = os.path.join(temp_dir, f"seed_{ind.id}.pt")
-            torch.save(ind.model.state_dict(), sd_path)
-            # payload: (child_graph, child_sd_path, parent_graph, parent_sd_path, is_approx)
-            pc = pickle.dumps((ind.graph, sd_path, None, None, False))
-            payloads_g0.append((idx, pc))
-        except Exception as e:
-            error_logger.error("Gen 0 serialise error for %s: %s", ind.id, e)
+
+    # Build payloads: each seed trains from scratch (no parent)
+    seed_triples = [(ind, None, False) for ind in population]
+    payloads_g0, paths_g0 = _build_payloads(seed_triples, temp_dir, gen=0)
 
     if payloads_g0:
-        trained_seeds = _parallel_train(
+        trained_seeds = _train_all(
             payloads_g0, cfg,
             train_epochs=cfg.INIT_EPOCHS,
             train_lr=cfg.INIT_LR,
             desc="Gen 0 | Seed Training",
+            device=device,
         )
         if trained_seeds:
             population = trained_seeds
+
+    # Clean up seed temp files
+    for path in paths_g0:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     population = pareto_front(population)
     population = fill_with_diversity(population, population, cfg.MIN_POP)
@@ -1794,13 +2120,13 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
         gen_start = time.time()
         logger.info("===== Generation %d =====", gen)
 
-        # Progressive epoch schedule
-        if cfg.EPOCH_PROGRESSION:
-            child_epochs = cfg.CHILD_EPOCHS + int(gen / 5)
-        else:
-            child_epochs = cfg.CHILD_EPOCHS
+        child_epochs = (
+            cfg.CHILD_EPOCHS + int(gen / 5)
+            if cfg.EPOCH_PROGRESSION
+            else cfg.CHILD_EPOCHS
+        )
 
-        parent_temp_paths = []   # track for cleanup in finally
+        parent_temp_paths = []
 
         try:
             # --------------------------------------------------------------
@@ -1811,20 +2137,20 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                         generation=gen)
 
             # --------------------------------------------------------------
-            # STEP 2: Sample npc parents (inverse density)
+            # STEP 2: Sample npc parents (inverse KDE density)
             # --------------------------------------------------------------
             parents = sampler.sample(
                 population, cfg.N_CHILDREN, allow_repeats=True
             )
             if not parents:
-                logger.warning("Gen %d: sampler returned no parents — skipping", gen)
+                logger.warning("Gen %d: no parents sampled — skipping", gen)
                 history[gen] = history[gen - 1]
                 continue
 
             # --------------------------------------------------------------
             # STEP 3: Generate npc candidate children (NO training yet)
             # --------------------------------------------------------------
-            candidates  = []   # list of (child_Individual, parent_Individual, is_approx)
+            candidates = []   # (child_Individual, parent_Individual, is_approx)
 
             for p in parents:
                 try:
@@ -1832,11 +2158,11 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                     if new_graph is None:
                         continue
 
-                    approx = is_approx_op(op_name)
-                    child  = Individual(new_graph)
+                    approx      = is_approx_op(op_name)
+                    child       = Individual(new_graph)
                     child.op_name = op_name
 
-                    # --- Lamarckian weight transfer ---
+                    # Lamarckian weight transfer (CPU, no GPU needed)
                     try:
                         from morphisms.weights import transfer_weights
                         parent_model = p.build_model()
@@ -1845,23 +2171,25 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                                          child.graph, op_name, target_info)
                     except Exception as e:
                         error_logger.error(
-                            "Weight transfer failed %s→%s (%s): %s",
-                            p.id, child.id, op_name, e
+                            "Weight transfer %s→%s (%s): %s",
+                            p.id, child.id, op_name, e,
                         )
-                        # child still exists with random init; do not discard
+                        # child has random init — still valid
 
                     candidates.append((child, p, approx))
 
                 except Exception as e:
-                    error_logger.error("Child generation error from %s: %s", p.id, e)
+                    error_logger.error(
+                        "Child gen error from %s: %s", p.id, e
+                    )
 
             if not candidates:
-                logger.warning("Gen %d: no candidates generated — skipping", gen)
+                logger.warning("Gen %d: no candidates generated", gen)
                 history[gen] = history[gen - 1]
                 continue
 
             # --------------------------------------------------------------
-            # STEP 4: Evaluate CHEAP objectives on all candidates (free)
+            # STEP 4: Evaluate CHEAP objectives (free — no training)
             # --------------------------------------------------------------
             valid_candidates = []
             for child, parent, approx in candidates:
@@ -1870,15 +2198,16 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                         objective_keys=cfg.CHEAP_OBJECTIVES,
                         input_size=(1, 3, 32, 32),
                     )
-                    param_count = cheap.get("params", 0)
-                    if param_count <= cfg.MAX_PARAMS:
+                    if cheap.get("params", 0) <= cfg.MAX_PARAMS:
                         valid_candidates.append((child, parent, approx))
                     else:
-                        logger.debug("Candidate %s exceeds MAX_PARAMS (%d > %d)",
-                                     child.id, param_count, cfg.MAX_PARAMS)
+                        logger.debug(
+                            "Candidate %s exceeds MAX_PARAMS", child.id
+                        )
                 except Exception as e:
-                    error_logger.error("Cheap eval failed for candidate %s: %s",
-                                       child.id, e)
+                    error_logger.error(
+                        "Cheap eval failed for %s: %s", child.id, e
+                    )
 
             if not valid_candidates:
                 logger.warning("Gen %d: all candidates exceed MAX_PARAMS", gen)
@@ -1887,88 +2216,62 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
 
             # --------------------------------------------------------------
             # STEP 5: KDE filter — sample nac accepted children
-            #         (inverse density on the CANDIDATES)
             # --------------------------------------------------------------
             candidate_inds = [c for c, _, _ in valid_candidates]
             sampler.fit(candidate_inds,
                         objective_keys=cfg.CHEAP_OBJECTIVES,
                         generation=gen)
-            n_accept = min(cfg.N_ACCEPT, len(valid_candidates))
+            n_accept      = min(cfg.N_ACCEPT, len(valid_candidates))
             accepted_inds = sampler.sample(
                 candidate_inds, n_accept, allow_repeats=False
             )
             accepted_set = {id(ind) for ind in accepted_inds}
 
             accepted_triples = [
-                (c, p, a) for c, p, a in valid_candidates
+                (c, p, a)
+                for c, p, a in valid_candidates
                 if id(c) in accepted_set
             ]
 
-            logger.info("Gen %d: %d candidates → %d accepted for training",
-                        gen, len(valid_candidates), len(accepted_triples))
+            logger.info(
+                "Gen %d: %d candidates → %d accepted for training",
+                gen, len(valid_candidates), len(accepted_triples),
+            )
 
             # --------------------------------------------------------------
-            # STEP 6: Train ONLY accepted children (expensive)
+            # STEP 6: Train only accepted children (expensive)
             # --------------------------------------------------------------
-            pickled_children = []
-            for idx, (child, parent, approx) in enumerate(accepted_triples):
-                try:
-                    child_sd_path  = None
-                    parent_sd_path = None
-
-                    if child.model is not None:
-                        child_sd_path = os.path.join(
-                            temp_dir, f"child_{child.id}_{gen}.pt"
-                        )
-                        torch.save(child.model.state_dict(), child_sd_path)
-
-                    if parent.model is not None:
-                        parent_sd_path = os.path.join(
-                            temp_dir,
-                            f"parent_{parent.id}_for_{child.id}_{gen}.pt"
-                        )
-                        torch.save(parent.model.state_dict(), parent_sd_path)
-                        parent_temp_paths.append(parent_sd_path)
-
-                    pc = pickle.dumps((
-                        child.graph, child_sd_path,
-                        parent.graph, parent_sd_path,
-                        approx,
-                    ))
-                    pickled_children.append((idx, pc))
-
-                except Exception as e:
-                    error_logger.error(
-                        "Gen %d: serialise error for child %s: %s",
-                        gen, child.id, e
-                    )
+            payloads, parent_temp_paths = _build_payloads(
+                accepted_triples, temp_dir, gen
+            )
 
             trained_children = []
-            if pickled_children:
-                trained_children = _parallel_train(
-                    pickled_children, cfg,
+            if payloads:
+                trained_children = _train_all(
+                    payloads, cfg,
                     train_epochs=child_epochs,
                     train_lr=cfg.CHILD_LR,
-                    desc=f"Gen {gen} | Training {len(pickled_children)} children",
+                    desc=f"Gen {gen} | Training {len(payloads)} children",
+                    device=device,
                 )
 
             # --------------------------------------------------------------
-            # STEP 7: Pareto update
+            # STEP 7: Pareto update + diversity fill
             # --------------------------------------------------------------
             if trained_children:
-                combined     = population + trained_children
-                new_front    = pareto_front(combined)
-                new_pop      = fill_with_diversity(new_front, combined,
-                                                   cfg.MIN_POP)
-                population   = new_pop
+                combined   = population + trained_children
+                new_front  = pareto_front(combined)
+                population = fill_with_diversity(new_front, combined,
+                                                 cfg.MIN_POP)
             else:
                 logger.warning("Gen %d: no children trained successfully", gen)
 
         except Exception as e:
-            error_logger.error("Unhandled error in gen %d: %s\n%s",
-                               gen, e, traceback.format_exc())
+            error_logger.error(
+                "Unhandled error in gen %d: %s\n%s",
+                gen, e, traceback.format_exc(),
+            )
         finally:
-            # Clean up parent temp weight files
             for path in parent_temp_paths:
                 try:
                     os.remove(path)
@@ -1979,7 +2282,7 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                         gen, elapsed, len(population))
 
         # ------------------------------------------------------------------
-        # Save history and model weights for this generation
+        # Save history + model weights for this generation
         # ------------------------------------------------------------------
         history[gen] = _save_generation_models(population, gen, models_dir)
         _print_summary(gen, population)
@@ -4861,15 +5164,16 @@ FILE:   distill.py
 PATH:   .\train\distill.py
 ################################################################################
 
+# train/distill.py
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import gc
-from tqdm import tqdm
 from utils.logger import get_logger
 
 logger = get_logger("distill", logfile="logs/distill.log")
+
 
 def train_with_distillation(
     student_model: nn.Module,
@@ -4878,555 +5182,123 @@ def train_with_distillation(
     device="cpu",
     epochs=1,
     temperature=3.0,
-    alpha=0.0,
-    lr=0.01,
+    alpha=0.0,       # 0.0 = pure KD alignment, 1.0 = pure CE hard labels
+    lr=0.001,
     weight_decay=1e-4,
     optimizer_name="sgd",
-    show_progress=True
+    show_progress=True,
+    use_amp=False,
 ):
+    """
+    Knowledge-distillation alignment phase for ANM children.
+
+    Called BEFORE standard training to recover accuracy lost by approximate
+    morphisms (prune, sepconv, remove).
+
+    Parameters
+    ----------
+    use_amp : bool
+        Automatic Mixed Precision — gives 1.5-2x GPU speedup.
+        Automatically disabled if device is not CUDA.
+    """
+    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    use_amp = use_amp and is_cuda
+
     student_model.to(device)
     teacher_model.to(device)
-    
     student_model.train()
     teacher_model.eval()
 
-    # Strictly freeze teacher parameters to prevent massive memory leaks
+    # Freeze teacher completely
     for param in teacher_model.parameters():
         param.requires_grad = False
 
     criterion_hard = nn.CrossEntropyLoss()
-    criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-    optimizer = optim.SGD(
-        student_model.parameters(), 
-        lr=lr, 
-        momentum=0.9, 
-        weight_decay=weight_decay 
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion_soft = nn.KLDivLoss(reduction="batchmean")
 
-    logger.info("Starting Pure Distillation Alignment: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
-                epochs, temperature, alpha, lr, device)
+    name = optimizer_name.lower()
+    params = [p for p in student_model.parameters() if p.requires_grad]
+    if name == "adam":
+        optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    elif name == "adamw":
+        optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    else:
+        optimizer = optim.SGD(params, lr=lr, momentum=0.9,
+                              weight_decay=weight_decay)
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(epochs, 1)
+    )
+
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+
+    logger.info(
+        "Distillation: epochs=%d T=%.1f alpha=%.2f lr=%.4f device=%s amp=%s",
+        epochs, temperature, alpha, lr, device, use_amp,
+    )
 
     for epoch in range(epochs):
-        running_loss = 0.0
-        
-        # Respect the show_progress flag to avoid terminal spam from workers
-        batch_iter = tqdm(train_loader, desc=f"Aligning Weights [{epoch + 1}/{epochs}]", leave=False, unit="batch", disable=not show_progress)
-        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                batch_iter = tqdm(train_loader,
+                                  desc=f"Distill [{epoch+1}/{epochs}]",
+                                  leave=False, unit="batch")
+            except ImportError:
+                batch_iter = train_loader
+        else:
+            batch_iter = train_loader
+
         for batch_idx, (inputs, targets) in enumerate(batch_iter):
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs  = inputs.to(device,  non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            student_logits = student_model(inputs)
-            
-            with torch.no_grad():
-                teacher_logits = teacher_model(inputs)
+            optimizer.zero_grad(set_to_none=True)
 
-            loss_hard = criterion_hard(student_logits, targets)
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    student_logits = student_model(inputs)
+                    with torch.no_grad():
+                        teacher_logits = teacher_model(inputs)
 
-            student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-            teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-            loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+                    loss_hard = criterion_hard(student_logits, targets)
+                    s_log_p   = F.log_softmax(student_logits / temperature, dim=1)
+                    t_p       = F.softmax(teacher_logits    / temperature, dim=1)
+                    loss_soft = criterion_soft(s_log_p, t_p) * (temperature ** 2)
+                    loss      = alpha * loss_hard + (1.0 - alpha) * loss_soft
 
-            # With alpha=0.0, this is pure mimicking of the teacher
-            loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-            optimizer.step()
-            running_loss += loss.item()
-            
-            if show_progress:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(),
+                                               max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                student_logits = student_model(inputs)
+                with torch.no_grad():
+                    teacher_logits = teacher_model(inputs)
+
+                loss_hard = criterion_hard(student_logits, targets)
+                s_log_p   = F.log_softmax(student_logits / temperature, dim=1)
+                t_p       = F.softmax(teacher_logits    / temperature, dim=1)
+                loss_soft = criterion_soft(s_log_p, t_p) * (temperature ** 2)
+                loss      = alpha * loss_hard + (1.0 - alpha) * loss_soft
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(),
+                                               max_norm=5.0)
+                optimizer.step()
+
+            if show_progress and hasattr(batch_iter, "set_postfix"):
                 batch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Force memory cleanup to stop Windows SegFaults
-            del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
-            if batch_idx % 10 == 0:
+            # Periodic cleanup to avoid accumulating graph memory
+            if batch_idx % 20 == 0:
                 gc.collect()
 
         scheduler.step()
 
-# ################################################################################
-# # FOLDER: train
-# # FILE:   distill.py
-# # PATH:   .\train\distill.py
-# ################################################################################
-
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import torch.optim as optim
-# import gc
-# from tqdm import tqdm
-# from utils.logger import get_logger
-
-# logger = get_logger("distill", logfile="logs/distill.log")
-
-# def train_with_distillation(
-#     student_model: nn.Module,
-#     teacher_model: nn.Module,
-#     train_loader,
-#     device="cpu",
-#     epochs=1,
-#     temperature=3.0,
-#     alpha=0.0,  # PURE DISTILLATION: 0.0 means ignore hard labels, strictly align to teacher.
-#     lr=0.01
-# ):
-#     student_model.to(device)
-#     teacher_model.to(device)
-    
-#     student_model.train()
-#     teacher_model.eval()
-
-#     # Strictly freeze teacher parameters to prevent massive memory leaks
-#     for param in teacher_model.parameters():
-#         param.requires_grad = False
-
-#     criterion_hard = nn.CrossEntropyLoss()
-#     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-#     optimizer = optim.SGD(
-#         student_model.parameters(), 
-#         lr=lr, 
-#         momentum=0.9, 
-#         weight_decay=1e-4 
-#     )
-#     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-#     logger.info("Starting Pure Distillation Alignment: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
-#                 epochs, temperature, alpha, lr, device)
-
-#     for epoch in range(epochs):
-#         running_loss = 0.0
-        
-#         batch_iter = tqdm(train_loader, desc=f"Aligning Weights [{epoch + 1}/{epochs}]", leave=False, unit="batch")
-        
-#         for batch_idx, (inputs, targets) in enumerate(batch_iter):
-#             inputs, targets = inputs.to(device), targets.to(device)
-
-#             optimizer.zero_grad()
-#             student_logits = student_model(inputs)
-            
-#             with torch.no_grad():
-#                 teacher_logits = teacher_model(inputs)
-
-#             loss_hard = criterion_hard(student_logits, targets)
-
-#             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-#             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-#             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
-
-#             # With alpha=0.0, this is pure mimicking of the teacher
-#             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-#             loss.backward()
-#             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-#             optimizer.step()
-#             running_loss += loss.item()
-            
-#             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
-
-#             # Force memory cleanup to stop Windows SegFaults
-#             del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
-#             if batch_idx % 10 == 0:
-#                 gc.collect()
-
-#         scheduler.step()
-
-# # # train/distill.py
-# # import torch
-# # import torch.nn as nn
-# # import torch.nn.functional as F
-# # import torch.optim as optim
-# # import gc
-# # from tqdm import tqdm
-# # from utils.logger import get_logger
-
-# # logger = get_logger("distill", logfile="logs/distill.log")
-
-# # def train_with_distillation(
-# #     student_model: nn.Module,
-# #     teacher_model: nn.Module,
-# #     train_loader,
-# #     device="cpu",
-# #     epochs=1,
-# #     temperature=3.0,
-# #     alpha=0.5,
-# #     lr=0.01
-# # ):
-# #     student_model.to(device)
-# #     teacher_model.to(device)
-    
-# #     student_model.train()
-# #     teacher_model.eval()
-
-# #     # FIX: Strictly freeze teacher parameters to prevent massive memory leaks
-# #     for param in teacher_model.parameters():
-# #         param.requires_grad = False
-
-# #     criterion_hard = nn.CrossEntropyLoss()
-# #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-# #     optimizer = optim.SGD(
-# #         student_model.parameters(), 
-# #         lr=lr, 
-# #         momentum=0.9, 
-# #         weight_decay=1e-4 
-# #     )
-# #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-# #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
-# #                 epochs, temperature, alpha, lr, device)
-
-# #     for epoch in range(epochs):
-# #         running_loss = 0.0
-        
-# #         batch_iter = tqdm(train_loader, desc=f"Distill Epoch [{epoch + 1}/{epochs}]", leave=False, unit="batch")
-        
-# #         for batch_idx, (inputs, targets) in enumerate(batch_iter):
-# #             inputs, targets = inputs.to(device), targets.to(device)
-
-# #             optimizer.zero_grad()
-# #             student_logits = student_model(inputs)
-            
-# #             with torch.no_grad():
-# #                 teacher_logits = teacher_model(inputs)
-
-# #             loss_hard = criterion_hard(student_logits, targets)
-
-# #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-# #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-# #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
-
-# #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-# #             loss.backward()
-# #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-# #             optimizer.step()
-# #             running_loss += loss.item()
-            
-# #             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
-
-# #             # FIX: Force memory cleanup to stop Windows SegFaults
-# #             del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
-# #             if batch_idx % 10 == 0:
-# #                 gc.collect()
-
-# #         scheduler.step()
-
-
-# # # # train/distill.py
-# # # import torch
-# # # import torch.nn as nn
-# # # import torch.nn.functional as F
-# # # import torch.optim as optim
-# # # from tqdm import tqdm
-# # # from utils.logger import get_logger
-
-# # # logger = get_logger("distill", logfile="logs/distill.log")
-
-# # # def train_with_distillation(
-# # #     student_model: nn.Module,
-# # #     teacher_model: nn.Module,
-# # #     train_loader,
-# # #     device="cpu",
-# # #     epochs=1,
-# # #     temperature=3.0,
-# # #     alpha=0.5,
-# # #     lr=0.01
-# # # ):
-# # #     student_model.to(device)
-# # #     teacher_model.to(device)
-    
-# # #     student_model.train()
-# # #     teacher_model.eval()
-
-# # #     criterion_hard = nn.CrossEntropyLoss()
-# # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-# # #     optimizer = optim.SGD(
-# # #         student_model.parameters(), 
-# # #         lr=lr, 
-# # #         momentum=0.9, 
-# # #         weight_decay=1e-4 
-# # #     )
-# # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-# # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
-# # #                 epochs, temperature, alpha, lr, device)
-
-# # #     for epoch in range(epochs):
-# # #         running_loss = 0.0
-        
-# # #         # Added tqdm progress bar for the distillation batch loop
-# # #         batch_iter = tqdm(train_loader, desc=f"Distill Epoch [{epoch + 1}/{epochs}]", leave=False, unit="batch")
-        
-# # #         for batch_idx, (inputs, targets) in enumerate(batch_iter):
-# # #             inputs, targets = inputs.to(device), targets.to(device)
-
-# # #             optimizer.zero_grad()
-# # #             student_logits = student_model(inputs)
-            
-# # #             with torch.no_grad():
-# # #                 teacher_logits = teacher_model(inputs)
-
-# # #             loss_hard = criterion_hard(student_logits, targets)
-
-# # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-# # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-# # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
-
-# # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-# # #             loss.backward()
-# # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-# # #             optimizer.step()
-# # #             running_loss += loss.item()
-            
-# # #             # Update the progress bar with the current combined loss
-# # #             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
-
-# # #         scheduler.step()
-
-
-# # # # # train/distill.py
-# # # # import torch
-# # # # import torch.nn as nn
-# # # # import torch.nn.functional as F
-# # # # import torch.optim as optim
-# # # # from utils.logger import get_logger
-
-# # # # logger = get_logger("distill", logfile="logs/distill.log")
-
-# # # # def train_with_distillation(
-# # # #     student_model: nn.Module,
-# # # #     teacher_model: nn.Module,
-# # # #     train_loader,
-# # # #     device="cpu",
-# # # #     epochs=1,
-# # # #     temperature=3.0,
-# # # #     alpha=0.5,
-# # # #     lr=0.01
-# # # # ):
-# # # #     student_model.to(device)
-# # # #     teacher_model.to(device)
-    
-# # # #     student_model.train()
-# # # #     teacher_model.eval()
-
-# # # #     criterion_hard = nn.CrossEntropyLoss()
-# # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-# # # #     optimizer = optim.SGD(
-# # # #         student_model.parameters(), 
-# # # #         lr=lr, 
-# # # #         momentum=0.9, 
-# # # #         weight_decay=1e-4 
-# # # #     )
-# # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-# # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
-# # # #                 epochs, temperature, alpha, lr, device)
-
-# # # #     for epoch in range(epochs):
-# # # #         running_loss = 0.0
-# # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
-# # # #             inputs, targets = inputs.to(device), targets.to(device)
-
-# # # #             optimizer.zero_grad()
-# # # #             student_logits = student_model(inputs)
-            
-# # # #             with torch.no_grad():
-# # # #                 teacher_logits = teacher_model(inputs)
-
-# # # #             loss_hard = criterion_hard(student_logits, targets)
-
-# # # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-# # # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-# # # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
-
-# # # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-# # # #             loss.backward()
-# # # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-# # # #             optimizer.step()
-# # # #             running_loss += loss.item()
-
-# # # #         scheduler.step()
-
-# # # # # # train/distill.py
-# # # # # import torch
-# # # # # import torch.nn as nn
-# # # # # import torch.nn.functional as F
-# # # # # import torch.optim as optim
-# # # # # from utils.logger import get_logger
-
-# # # # # logger = get_logger("distill", logfile="logs/distill.log")
-
-# # # # # def train_with_distillation(
-# # # # #     student_model: nn.Module,
-# # # # #     teacher_model: nn.Module,
-# # # # #     train_loader,
-# # # # #     device="cpu",
-# # # # #     epochs=1,
-# # # # #     temperature=3.0,
-# # # # #     alpha=0.5
-# # # # # ):
-# # # # #     """
-# # # # #     Trains a student model using soft targets from a frozen teacher model.
-# # # # #     Args:
-# # # # #         student_model: The new child Architecture (to be trained).
-# # # # #         teacher_model: The parent Architecture (frozen).
-# # # # #         train_loader: DataLoader for the training set.
-# # # # #         device: "cpu" or "cuda".
-# # # # #         epochs: Number of epochs to train.
-# # # # #         temperature: Softens the teacher's probability distribution (higher = softer).
-# # # # #         alpha: Weighting between the hard loss (true labels) and soft loss (teacher labels).
-# # # # #                alpha=0.5 means a 50/50 split.
-# # # # #     """
-# # # # #     student_model.to(device)
-# # # # #     teacher_model.to(device)
-    
-# # # # #     # The student learns; the teacher only predicts.
-# # # # #     student_model.train()
-# # # # #     teacher_model.eval()
-
-# # # # #     # Hard targets (Standard Cross Entropy)
-# # # # #     criterion_hard = nn.CrossEntropyLoss()
-# # # # #     # Soft targets (Kullback-Leibler Divergence)
-# # # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-# # # # #     # Setup matching the standard trainer.py to ensure fair comparisons
-# # # # #     optimizer = optim.SGD(
-# # # # #         student_model.parameters(), 
-# # # # #         lr=0.01, 
-# # # # #         momentum=0.9, 
-# # # # #         weight_decay=1e-4 
-# # # # #     )
-# # # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-# # # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f on %s", 
-# # # # #                 epochs, temperature, alpha, device)
-
-# # # # #     for epoch in range(epochs):
-# # # # #         running_loss = 0.0
-        
-# # # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
-# # # # #             inputs, targets = inputs.to(device), targets.to(device)
-
-# # # # #             optimizer.zero_grad()
-
-# # # # #             # 1. Forward pass for the student
-# # # # #             student_logits = student_model(inputs)
-            
-# # # # #             # 2. Forward pass for the frozen teacher
-# # # # #             with torch.no_grad():
-# # # # #                 teacher_logits = teacher_model(inputs)
-
-# # # # #             # 3. Calculate Hard Loss (Student vs. True Labels)
-# # # # #             loss_hard = criterion_hard(student_logits, targets)
-
-# # # # #             # 4. Calculate Soft Loss (Student vs. Teacher)
-# # # # #             # Log-Softmax for the student, standard Softmax for the teacher
-# # # # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-# # # # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
-            
-# # # # #             # Multiply by T^2 to scale the gradients back up
-# # # # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
-
-# # # # #             # 5. Combine Losses
-# # # # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
-
-# # # # #             # 6. Backward pass and Optimization
-# # # # #             loss.backward()
-            
-# # # # #             # Gradient clipping to match trainer.py and prevent loss spikes
-# # # # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
-            
-# # # # #             optimizer.step()
-# # # # #             running_loss += loss.item()
-
-# # # # #         scheduler.step()
-# # # # #         logger.debug("Distillation Epoch [%d/%d] completed. Avg Loss: %.4f", epoch + 1, epochs, running_loss / len(train_loader))
-
-# # # # #     logger.info("Distillation training complete.")
-
-# # # # # # # train/distill.py
-# # # # # # import torch
-# # # # # # import torch.nn as nn
-# # # # # # import torch.nn.functional as F
-# # # # # # import torch.optim as optim
-# # # # # # from utils.logger import get_logger
-
-# # # # # # logger = get_logger("distill", logfile="logs/distill.log")
-
-# # # # # # def train_with_distillation(
-# # # # # #     student_model: nn.Module,
-# # # # # #     teacher_model: nn.Module,
-# # # # # #     train_loader,
-# # # # # #     device="cpu",
-# # # # # #     epochs=1,
-# # # # # #     temperature=3.0,
-# # # # # #     alpha=0.5
-# # # # # # ):
-# # # # # #     """
-# # # # # #     Trains a student model using soft targets from a frozen teacher model.
-    
-# # # # # #     Args:
-# # # # # #         student_model: The new child Architecture (to be trained).
-# # # # # #         teacher_model: The parent Architecture (frozen).
-# # # # # #         train_loader: DataLoader for the training set.
-# # # # # #         device: "cpu" or "cuda".
-# # # # # #         epochs: Number of epochs to train.
-# # # # # #         temperature: Softens the teacher's probability distribution (higher = softer).
-# # # # # #         alpha: Weighting between the hard loss (true labels) and soft loss (teacher labels).
-# # # # # #                alpha=0.5 means a 50/50 split.
-# # # # # #     """
-# # # # # #     student_model.to(device)
-# # # # # #     teacher_model.to(device)
-    
-# # # # # #     # The student learns; the teacher only predicts.
-# # # # # #     student_model.train()
-# # # # # #     teacher_model.eval()
-
-# # # # # #     # Hard targets (Standard Cross Entropy)
-# # # # # #     criterion_hard = nn.CrossEntropyLoss()
-# # # # # #     # Soft targets (Kullback-Leibler Divergence)
-# # # # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
-    
-# # # # # #     # Setup matching the standard trainer.py to ensure fair comparisons
-# # # # # #     optimizer = optim.SGD(
-# # # # # #         student_model.parameters(), 
-# # # # # #         lr=0.01, 
-# # # # # #         momentum=0.9, 
-# # # # # #         weight_decay=1e-4 
-# # # # # #     )
-# # # # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-# # # # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f on %s", 
-# # # # # #                 epochs, temperature, alpha, device)
-
-# # # # # #     for epoch in range(epochs):
-# # # # # #         running_loss = 0.0
-        
-# # # # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
-# # # # # #             inputs, targets = inputs.to(device), targets.to(device)
-
-# # # # # #             optimizer.zero_grad()
-
-# # # # # #             # 1. Forward pass for the student
-# # # # # #             student_logits = student_model(inputs)
-            
-# # # # # #             # 2. Forward pass for the frozen teacher
-# # # # # #             with torch.no_grad():
-# # # # # #                 teacher_logits = teacher_model(inputs)
-
-# # # # # #             # 3. Calculate Hard Loss (Student vs. True Labels)
-# # # # # #             loss_hard = criterion_hard(student_logits, targets)
-
-# # # # # #             # 4. Calculate Soft Loss (Student vs. Teacher)
-# # # # # #             # Log-Softmax for the student, standard
+    logger.info("Distillation complete.")
 
 ================================================================================
 END OF: train/distill.py
@@ -5445,41 +5317,48 @@ from utils.logger import get_logger
 
 logger = get_logger("evaluate", logfile="logs/evaluate.log")
 
-def evaluate_accuracy(model, val_loader, device="cpu"):
-    """
-    Calculates validation error. 
-    Returns: float (error rate between 0.0 and 1.0, lower is better)
-    """
-    model.to(device)
-    
-    # FIX: Explicit eval mode. Without this, passing a batch through 
-    # the network will corrupt BatchNorm running statistics.
-    model.eval() 
-    
-    correct = 0
-    total = 0
 
-    # FIX: no_grad() prevents PyTorch from building a computation graph 
-    # during validation, saving massive amounts of VRAM.
+def evaluate_accuracy(model, val_loader, device="cpu", use_amp=False) -> float:
+    """
+    Returns validation error in [0, 1].  Lower is better.
+
+    Parameters
+    ----------
+    use_amp : bool
+        Use fp16 for inference — faster on GPU, no accuracy change.
+        Automatically disabled if device is not CUDA.
+    """
+    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    use_amp = use_amp and is_cuda
+
+    model.to(device)
+    model.eval()
+
+    correct = 0
+    total   = 0
+
     with torch.no_grad():
         for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            outputs = model(inputs)
+            inputs  = inputs.to(device,  non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model(inputs)
+            else:
+                outputs = model(inputs)
+
             _, predicted = outputs.max(1)
-            
-            total += targets.size(0)
+            total   += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
     if total == 0:
-        logger.warning("Validation loader is empty! Returning 1.0 error.")
+        logger.warning("Empty validation loader — returning error=1.0")
         return 1.0
 
-    accuracy = correct / total
-    val_error = 1.0 - accuracy
-    
-    logger.info("Evaluation complete. Accuracy: %.2f%%, Val Error: %.4f", accuracy * 100, val_error)
-    
+    acc       = correct / total
+    val_error = 1.0 - acc
+    logger.debug("Val accuracy=%.2f%%  val_error=%.4f", acc * 100, val_error)
     return val_error
 
 ================================================================================
@@ -5504,32 +5383,39 @@ logger = get_logger("trainer", logfile="logs/trainer.log")
 
 def _build_optimizer(model, optimizer_name: str, lr: float, weight_decay: float):
     params = [p for p in model.parameters() if p.requires_grad]
-    name = optimizer_name.lower()
+    name   = optimizer_name.lower()
     if name == "adam":
         return optim.Adam(params, lr=lr, weight_decay=weight_decay)
     elif name == "adamw":
         return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    else:  # default: sgd
+    else:  # sgd (default)
         return optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
 
 
 def train_model(model, train_loader, device="cpu", epochs=1,
                 lr=0.01, weight_decay=1e-4,
-                optimizer_name="sgd", show_progress=True):
+                optimizer_name="sgd",
+                show_progress=True,
+                use_amp=False):
     """
     Standard supervised training loop.
 
     Parameters
     ----------
-    model          : nn.Module — trained IN-PLACE on the given device.
+    model          : nn.Module — trained IN-PLACE on *device*.
     train_loader   : DataLoader
     device         : "cpu" or "cuda"
     epochs         : number of full passes over train_loader
     lr             : learning rate
-    weight_decay   : L2 regularisation coefficient
+    weight_decay   : L2 regularisation
     optimizer_name : "sgd" | "adam" | "adamw"
-    show_progress  : if True, print per-epoch loss (no tqdm in workers)
+    show_progress  : print tqdm bar (disable in subprocess workers)
+    use_amp        : Automatic Mixed Precision — fp16 forward, fp32 gradients.
+                     Gives 1.5-2x GPU speedup.  Automatically disabled on CPU.
     """
+    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    use_amp = use_amp and is_cuda   # AMP only works on CUDA
+
     model.to(device)
     model.train()
 
@@ -5538,16 +5424,19 @@ def train_model(model, train_loader, device="cpu", epochs=1,
         logger.warning("No trainable params — skipping training.")
         return
 
-    optimizer = _build_optimizer(model, optimizer_name, lr, weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
-    criterion = nn.CrossEntropyLoss()
+    optimizer  = _build_optimizer(model, optimizer_name, lr, weight_decay)
+    scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    criterion  = nn.CrossEntropyLoss()
 
-    logger.info("train_model: epochs=%d lr=%.4f opt=%s device=%s",
-                epochs, lr, optimizer_name, device)
+    # GradScaler for AMP — no-op if use_amp=False
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+
+    logger.info("train_model: epochs=%d lr=%.4f opt=%s device=%s amp=%s",
+                epochs, lr, optimizer_name, device, use_amp)
 
     for epoch in range(epochs):
         running_loss = 0.0
-        n_batches = 0
+        n_batches    = 0
 
         if show_progress:
             try:
@@ -5561,17 +5450,32 @@ def train_model(model, train_loader, device="cpu", epochs=1,
             batch_iter = train_loader
 
         for inputs, targets in batch_iter:
-            inputs, targets = inputs.to(device), targets.to(device)
+            # non_blocking=True overlaps CPU→GPU transfer with GPU compute
+            inputs  = inputs.to(device,  non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+
+            if use_amp:
+                # fp16 forward pass
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model(inputs)
+                    loss    = criterion(outputs, targets)
+                # fp32 backward (scaler converts grads back)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss    = criterion(outputs, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
             running_loss += loss.item()
-            n_batches += 1
+            n_batches    += 1
 
             if show_progress and hasattr(batch_iter, "set_postfix"):
                 batch_iter.set_postfix(loss=f"{loss.item():.4f}")

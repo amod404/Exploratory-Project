@@ -1,7 +1,14 @@
 # config.py
 # =============================================================================
 # ALL USER-FACING HYPERPARAMETERS ARE IN THIS ONE FILE.
-# Change values here; nothing else needs to be touched for normal experiments.
+# Change values here; nothing else needs to be touched.
+#
+# GPU / Colab notes:
+#   - Set USE_AMP=True  for 1.5-2x speedup on any NVIDIA GPU (T4, A100, V100)
+#   - Set NUM_DATALOADER_WORKERS=2 on Colab (it has 2 CPU cores for prefetch)
+#   - BATCH_SIZE=256 works on Colab T4 for CIFAR; use 128 to be safe
+#   - ProcessPoolExecutor is automatically disabled when CUDA is available;
+#     models are trained sequentially on the GPU instead (much faster).
 # =============================================================================
 
 from dataclasses import dataclass, field
@@ -25,15 +32,12 @@ class NASConfig:
 
     # -------------------------------------------------------------------------
     # Cheap Objectives
-    # Controls what enters KDE sampling + Pareto dominance.
     # Options: any subset of ["params", "flops"]
-    #   ["params", "flops"]  → full multi-objective (slower, needs thop)
-    #   ["params"]           → params-only (fast, no model build for cheap eval)
+    #   ["params", "flops"]  → full multi-objective (needs thop)
+    #   ["params"]           → params-only (fastest, recommended for Colab)
     #   []                   → single-objective NAS (val_error only)
     # -------------------------------------------------------------------------
     CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params"])
-    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: [])
-    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params", "flops"])
 
     # -------------------------------------------------------------------------
     # Evolution
@@ -45,29 +49,27 @@ class NASConfig:
     N_CHILDREN: int = 24
 
     # nac: how many pass the KDE filter and enter expensive training.
-    # Ratio N_CHILDREN / N_ACCEPT should be at least 3:1 for meaningful filtering.
+    # Ratio N_CHILDREN / N_ACCEPT should be at least 3:1.
     N_ACCEPT: int = 8
 
     # Hard parameter cap; children exceeding this are discarded before training.
     MAX_PARAMS: int = 10_000_000
 
-    # Minimum Pareto population size.  If Pareto front shrinks below this,
-    # diverse dominated individuals are added to maintain breadth.
+    # Minimum Pareto population size.
     MIN_POP: int = 3
 
     # -------------------------------------------------------------------------
-    # Training Epochs  (THREE distinct phases — do NOT conflate them)
+    # Training Epochs  (THREE distinct phases)
     #
-    #   INIT_EPOCHS   : Gen 0 — training the seed population from scratch
-    #   CHILD_EPOCHS  : Gen 1+ — standard training for every accepted child
-    #   DISTILL_EPOCHS: ANM children only — distillation alignment BEFORE
-    #                   the standard CHILD_EPOCHS training phase
+    #   INIT_EPOCHS   : Gen 0 — training seed population from scratch
+    #   CHILD_EPOCHS  : Gen 1+ — standard training for accepted children
+    #   DISTILL_EPOCHS: ANM children only — distillation BEFORE CHILD_EPOCHS
     # -------------------------------------------------------------------------
     INIT_EPOCHS: int = 20
     CHILD_EPOCHS: int = 12
     DISTILL_EPOCHS: int = 5
 
-    # Set True to add +1 epoch every 5 generations (slow convergence boost)
+    # Set True to add +1 epoch every 5 generations
     EPOCH_PROGRESSION: bool = True
 
     # -------------------------------------------------------------------------
@@ -76,35 +78,42 @@ class NASConfig:
     # -------------------------------------------------------------------------
     OPTIMIZER: str = "sgd"
 
-    # Learning rates — separate per phase
-    # INIT_LR: float = 0.025        # Gen 0
-    # CHILD_LR: float = 0.01      # Gen 1+ training
-    # DISTILL_LR: float = 0.005    # Distillation alignment
-    INIT_LR: float = 0.01        # Gen 0
-    CHILD_LR: float = 0.005      # Gen 1+ training
-    DISTILL_LR: float = 0.001    # Distillation alignment
+    INIT_LR: float = 0.01
+    CHILD_LR: float = 0.005
+    DISTILL_LR: float = 0.001
 
-    # WEIGHT_DECAY: float = 3e-4
     WEIGHT_DECAY: float = 1e-4
 
-    # Distillation settings
     DISTILL_TEMPERATURE: float = 3.0
-    # 0.0 = pure teacher-mimicking, 1.0 = pure cross-entropy on hard labels
-    DISTILL_ALPHA: float = 0.0
+    DISTILL_ALPHA: float = 0.0   # 0.0 = pure KD, 1.0 = pure CE
 
     # -------------------------------------------------------------------------
-    # KDE Sampler
-    # Higher bandwidth → smoother density → more exploration (good early on).
-    # Lower bandwidth → sharper density → more exploitation (good later).
+    # KDE Sampler bandwidth
     # -------------------------------------------------------------------------
     KDE_BANDWIDTH: float = 0.3
 
     # -------------------------------------------------------------------------
+    # GPU / Performance
+    # -------------------------------------------------------------------------
+    # Automatic Mixed Precision (fp16 forward + fp32 gradients).
+    # Gives 1.5-2x speedup on NVIDIA GPUs with almost no accuracy loss.
+    # Automatically disabled if CUDA is not available.
+    USE_AMP: bool = True
+
+    # DataLoader worker processes for the MAIN process.
+    # Set 2 on Colab (it has 2 prefetch-CPU cores).
+    # Set 0 on Windows or if you hit "RuntimeError: DataLoader worker" errors.
+    # CPU subprocess workers always use 0 (nested MP is not safe).
+    NUM_DATALOADER_WORKERS: int = 2
+
+    # Pin memory for fast CPU→GPU transfers.
+    # Automatically forced to False when CUDA is unavailable.
+    PIN_MEMORY: bool = True
+
+    # -------------------------------------------------------------------------
     # UX / Debugging
     # -------------------------------------------------------------------------
-    # Set False for non-interactive environments (CI, HPC) or when logs are
-    # preferred over animated bars.  Workers always suppress their own bars.
-    SHOW_PROGRESS_BAR: bool = False
+    SHOW_PROGRESS_BAR: bool = True
 
 
 # Singleton — import this everywhere
