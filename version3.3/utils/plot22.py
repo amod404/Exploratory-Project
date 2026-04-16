@@ -145,10 +145,9 @@ def main():
     # =========================================================================
     # CONFIGURATION: Set your specific timestamp / experiment folder here
     # =========================================================================
-    RUN_DIR = r"results_CIFAR-10_20260412_012124" 
+    RUN_DIR = r"results_CIFAR-100_20260412_191158" 
     # RUN_DIR = r"results_CIFAR-10_20260412_111857" 
     # results_CIFAR-100_20260412_191158
-    # version3/results_CIFAR-10_20260412_012124
     
     history_path = os.path.join(RUN_DIR, "history", "history.pkl")
     

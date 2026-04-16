@@ -83,140 +83,166 @@ PATH:   .\config.py
 # config.py
 # =============================================================================
 # ALL USER-FACING HYPERPARAMETERS ARE IN THIS ONE FILE.
-# Change values here; nothing else needs to be touched.
 #
-# ── Laptop GPU (NVIDIA, CUDA) ────────────────────────────────────────────────
-#   - USE_AMP = True          → fp16 training, 1.5-2x speedup on any NVIDIA GPU
-#   - CUDNN_BENCHMARK = True  → cuDNN auto-tunes kernels for your exact GPU.
-#                               BIG speedup when input sizes never change.
-#                               CIFAR always 32x32 → always enable this.
-#   - NUM_DATALOADER_WORKERS  → Windows: MUST be 0 (Windows+CUDA workers crash)
-#                               The code auto-sets 0 on Windows for you.
-#                               Linux/Mac: 2-4 is good.
-#   - BATCH_SIZE              → Tune to your GPU VRAM:
-#                                 4 GB  →  64
-#                                 6 GB  → 128 (sweet spot for most laptops)
-#                                 8 GB  → 256
-#                                12 GB  → 512
-#   - PIN_MEMORY = True       → fast CPU→GPU transfers (auto-disabled on CPU)
+# Supported datasets (all auto-download unless noted):
 #
-# ── Google Colab ─────────────────────────────────────────────────────────────
-#   - NUM_DATALOADER_WORKERS = 2  (Colab Linux has 2 prefetch-CPU cores)
-#   - BATCH_SIZE = 128            (Colab T4 = 15 GB VRAM)
-#   - Everything else is the same.
+#   CIFAR-10      32x32   10 cls  ~170 MB  auto-download
+#   CIFAR-100     32x32  100 cls  ~170 MB  auto-download
+#   CINIC-10      32x32   10 cls  ~426 MB  auto-download  (CIFAR-10 + ImageNet mix)
+#   GTSRB         32x32   43 cls  ~300 MB  auto-download  (traffic signs)
+#   EUROSAT       64x64   10 cls   ~90 MB  auto-download  (satellite imagery)
+#   TINY_IMAGENET 64x64  200 cls  ~235 MB  auto-download
+#   IMAGENET     224x224 1000 cls  150 GB  manual download (FakeData fallback if absent)
+#   PLACES365    224x224  365 cls   24 GB  auto-download (small 256px version)
+#   COCO         224x224   80 cls   20 GB  manual download + pycocotools
 # =============================================================================
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset lookup tables  (auto-populated into __post_init__)
+# ---------------------------------------------------------------------------
+
+_INPUT_SIZES = {
+    "CIFAR-10":      (1, 3, 32,  32),
+    "CIFAR-100":     (1, 3, 32,  32),
+    "CINIC-10":      (1, 3, 32,  32),
+    "GTSRB":         (1, 3, 32,  32),
+    "EUROSAT":       (1, 3, 64,  64),
+    "TINY_IMAGENET": (1, 3, 64,  64),
+    "IMAGENET":      (1, 3, 224, 224),
+    "PLACES365":     (1, 3, 224, 224),
+    "COCO":          (1, 3, 224, 224),
+}
+
+_NUM_CLASSES = {
+    "CIFAR-10":      10,
+    "CIFAR-100":    100,
+    "CINIC-10":      10,
+    "GTSRB":         43,
+    "EUROSAT":       10,
+    "TINY_IMAGENET": 200,
+    "IMAGENET":     1000,
+    "PLACES365":     365,
+    "COCO":           80,
+}
+
+# Optimal batch sizes for NAS (balance speed vs. memory on a typical 8 GB GPU)
+_DEFAULT_BATCH = {
+    "CIFAR-10":      128,
+    "CIFAR-100":     128,
+    "CINIC-10":      128,
+    "GTSRB":         128,
+    "EUROSAT":        64,
+    "TINY_IMAGENET":  64,
+    "IMAGENET":       32,
+    "PLACES365":      32,
+    "COCO":           32,
+}
 
 
 @dataclass
 class NASConfig:
 
     # -------------------------------------------------------------------------
-    # Dataset
-    # Options: "CIFAR-10" | "CIFAR-100" | "IMAGENET"
+    # Dataset — change this one field to switch datasets
     # -------------------------------------------------------------------------
-    TARGET_DATASET: str = "CIFAR-100"
+    TARGET_DATASET: str = "GTSRB"
 
-    # True  → small subset of data (fast iteration / debugging)
-    # False → full dataset (production runs)
-    FAST_DEV_MODE: bool = False
+    # True  → small subset (fast iteration / debugging)
+    # False → full dataset (production)
+    FAST_DEV_MODE: bool = True
 
-    # Tune to your GPU VRAM (see table above)
-    BATCH_SIZE: int = 128
+    # Set to 0 to use the dataset-specific default in _DEFAULT_BATCH.
+    BATCH_SIZE: int = 0
 
     # -------------------------------------------------------------------------
     # Cheap Objectives
     # Options: any subset of ["params", "flops"]
-    #   ["params", "flops"]  → full multi-objective (needs thop)
-    #   ["params"]           → params-only (fastest, recommended)
+    #   ["params", "flops"]  → full multi-objective (needs thop installed)
+    #   ["params"]           → params-only (fastest, recommended for CPUs)
     #   []                   → single-objective NAS (val_error only)
     # -------------------------------------------------------------------------
-    CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params"])
+    CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params","flops"])
 
     # -------------------------------------------------------------------------
     # Evolution
     # -------------------------------------------------------------------------
-    GENERATIONS: int = 5
-    NUM_SEEDS: int = 12
+    GENERATIONS: int = 3
+    NUM_SEEDS: int = 7
 
-    # npc: candidates generated per generation.  Must be > N_ACCEPT.
+    # npc: candidates generated each generation  (must be > N_ACCEPT)
     N_CHILDREN: int = 24
 
-    # nac: how many pass the KDE filter and enter expensive training.
-    # Ratio N_CHILDREN / N_ACCEPT should be at least 3:1.
-    N_ACCEPT: int = 8
+    # nac: candidates that pass KDE filter → enter expensive training
+    # Ratio N_CHILDREN / N_ACCEPT should be ≥ 3:1 for meaningful filtering
+    N_ACCEPT: int = 7
 
-    # Hard parameter cap; children exceeding this are discarded before training.
+    # Models with more params than this are discarded before training
     MAX_PARAMS: int = 10_000_000
 
-    # Minimum Pareto population size.
+    # Minimum Pareto population size (diversity fill keeps it at least this large)
     MIN_POP: int = 3
 
     # -------------------------------------------------------------------------
-    # Training Epochs  (THREE distinct phases — do NOT conflate them)
+    # Training Epochs  (THREE separate phases — do NOT mix them)
     #
-    #   INIT_EPOCHS   : Gen 0 — train seed population from scratch
-    #   CHILD_EPOCHS  : Gen 1+ — standard training for accepted children
+    #   INIT_EPOCHS   : Gen 0 — seed population trained from scratch
+    #   CHILD_EPOCHS  : Gen 1+ — every accepted child trained
     #   DISTILL_EPOCHS: ANM children only — distillation BEFORE CHILD_EPOCHS
     # -------------------------------------------------------------------------
-    INIT_EPOCHS: int = 20
-    CHILD_EPOCHS: int = 12
-    DISTILL_EPOCHS: int = 5
+    INIT_EPOCHS: int = 1
+    CHILD_EPOCHS: int = 1
+    DISTILL_EPOCHS: int = 1
 
-    # Set True to add +1 epoch every 5 generations
+    # Add +1 epoch every 5 generations for slow convergence boost
     EPOCH_PROGRESSION: bool = True
 
     # -------------------------------------------------------------------------
-    # Optimizer & Regularisation
-    # OPTIMIZER options: "sgd" | "adam" | "adamw"
+    # Optimizer  (options: "sgd" | "adam" | "adamw")
     # -------------------------------------------------------------------------
     OPTIMIZER: str = "sgd"
 
-    INIT_LR: float = 0.01
-    CHILD_LR: float = 0.005
-    DISTILL_LR: float = 0.001
+    INIT_LR: float   = 0.01     # Gen 0 seed training
+    CHILD_LR: float  = 0.005    # Gen 1+ child training
+    DISTILL_LR: float = 0.001   # Distillation alignment
 
     WEIGHT_DECAY: float = 1e-4
 
     DISTILL_TEMPERATURE: float = 3.0
-    DISTILL_ALPHA: float = 0.0   # 0.0 = pure KD alignment, 1.0 = pure CE
+    DISTILL_ALPHA: float = 0.1  # 0.0 = pure teacher-mimicking, 1.0 = pure CE
 
     # -------------------------------------------------------------------------
-    # KDE Sampler
+    # KDE Sampler bandwidth
     # -------------------------------------------------------------------------
     KDE_BANDWIDTH: float = 0.3
 
     # -------------------------------------------------------------------------
-    # GPU / Performance
-    # -------------------------------------------------------------------------
-
-    # Automatic Mixed Precision (fp16 forward + fp32 gradients).
-    # 1.5-2x speedup on NVIDIA GPUs. Auto-disabled on CPU — safe to leave True.
-    USE_AMP: bool = True
-
-    # cuDNN benchmark mode: lets cuDNN profile and choose the fastest
-    # convolution algorithm for your specific GPU and input shape.
-    # CIFAR images are always 32x32 so shapes never change → always a win.
-    # Set False only if your input sizes vary significantly between batches.
-    CUDNN_BENCHMARK: bool = True
-
-    # DataLoader prefetch worker processes.
-    # ⚠ Windows + CUDA: set 0. The code auto-detects Windows and overrides
-    #   this to 0, so you don't have to change it manually.
-    # Linux/Mac with GPU: 2-4 works well.
-    # CPU-only (no GPU): 0 (subprocess overhead cancels any gain).
-    NUM_DATALOADER_WORKERS: int = 2
-
-    # Pin CPU memory for fast zero-copy CPU→GPU transfers.
-    # Auto-disabled when CUDA is not available — safe to leave True always.
-    PIN_MEMORY: bool = True
-
-    # -------------------------------------------------------------------------
     # UX / Debugging
     # -------------------------------------------------------------------------
+    # Controls ALL progress bars: both the outer model-level bar in the main
+    # process AND the batch-level bars inside training loops.
     SHOW_PROGRESS_BAR: bool = True
+
+    # -------------------------------------------------------------------------
+    # Derived fields — auto-set in __post_init__, do NOT edit manually
+    # -------------------------------------------------------------------------
+    INPUT_SIZE: Tuple = field(init=False)
+    NUM_CLASSES: int  = field(init=False)
+
+    def __post_init__(self):
+        if self.TARGET_DATASET not in _INPUT_SIZES:
+            supported = sorted(_INPUT_SIZES.keys())
+            raise ValueError(
+                f"Unknown dataset '{self.TARGET_DATASET}'.\n"
+                f"Supported datasets: {supported}"
+            )
+        self.INPUT_SIZE  = _INPUT_SIZES[self.TARGET_DATASET]
+        self.NUM_CLASSES = _NUM_CLASSES[self.TARGET_DATASET]
+        if self.BATCH_SIZE == 0:
+            self.BATCH_SIZE = _DEFAULT_BATCH[self.TARGET_DATASET]
 
 
 # Singleton — import this everywhere
@@ -237,31 +263,17 @@ PATH:   .\main.py
 # =============================================================================
 # Entry point for LEMONADE NAS.
 # ALL hyperparameters live in config.py — edit them there.
-#
-# ── Running on a laptop GPU (Windows) ────────────────────────────────────────
-#   python main.py
-#   (NUM_DATALOADER_WORKERS is auto-set to 0 on Windows — no action needed)
-#
-# ── Running on a laptop GPU (Linux) ──────────────────────────────────────────
-#   python main.py
-#
-# ── Running on Google Colab ───────────────────────────────────────────────────
-#   !python main.py
-#   OR: from main import main; main()
 # =============================================================================
 
 import os
-import sys
-import platform
-import multiprocessing
 
-# ---- Thread-count lock (must happen before any torch import) ----------------
-# Prevents CPU thread explosion when multiprocessing is used on CPU path.
-os.environ.setdefault("OMP_NUM_THREADS",        "1")
-os.environ.setdefault("MKL_NUM_THREADS",        "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS",   "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS",    "1")
+# Must be set BEFORE any PyTorch import to prevent thread-count explosion
+# in multiprocessing workers.
+os.environ["OMP_NUM_THREADS"]         = "1"
+os.environ["MKL_NUM_THREADS"]         = "1"
+os.environ["OPENBLAS_NUM_THREADS"]    = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"]  = "1"
+os.environ["NUMEXPR_NUM_THREADS"]     = "1"
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -271,7 +283,7 @@ import pickle
 import datetime
 import torch
 
-from config import CFG
+from config import CFG                          # ← single source of truth
 from evolution.lemonade_full import run_lemonade
 from evolution.operators import random_operator
 from evolution.individual import Individual
@@ -280,48 +292,25 @@ from utils.logger import get_logger
 
 logger = get_logger("main", logfile="logs/main.log")
 
-# =============================================================================
-# Platform-aware safety fixes
-# =============================================================================
-
-_IS_WINDOWS = platform.system() == "Windows"
-
-if _IS_WINDOWS and CFG.NUM_DATALOADER_WORKERS != 0:
-    # Windows + CUDA DataLoader workers is a known crash.
-    # Silently override — user does not need to change config.py.
-    CFG.NUM_DATALOADER_WORKERS = 0
-
-# =============================================================================
-# Dataset + num_classes wiring
-# =============================================================================
-
-_DATASET_META = {
-    "CIFAR-10":  (10,   128),
-    "CIFAR-100": (100,  128),
-    "IMAGENET":  (1000,  32),
-}
-
-NUM_CLASSES = _DATASET_META[CFG.TARGET_DATASET][0]
-if CFG.TARGET_DATASET == "IMAGENET" and CFG.BATCH_SIZE == 128:
-    CFG.BATCH_SIZE = 32   # ImageNet needs smaller batch even on good GPUs
-
 
 # =============================================================================
 # Seed population
 # =============================================================================
 
 def create_seed_population(num_seeds: int) -> list:
-    logger.info("Building %d seed architectures for %s (%d classes)",
-                num_seeds, CFG.TARGET_DATASET, NUM_CLASSES)
+    logger.info(
+        "Building %d seed architectures for %s (%d classes, input %s)",
+        num_seeds, CFG.TARGET_DATASET, CFG.NUM_CLASSES, CFG.INPUT_SIZE,
+    )
 
     base_graph = build_basenet_graph(
-        num_classes=NUM_CLASSES,
+        num_classes=CFG.NUM_CLASSES,
         dataset_type=CFG.TARGET_DATASET,
     )
     graphs = [base_graph]
 
     for _ in range(num_seeds - 1):
-        for _ in range(15):
+        for _ in range(15):        # up to 15 attempts to produce a valid variant
             tmp = Individual(copy.deepcopy(base_graph))
             new_graph, _, _ = random_operator(tmp)
             if new_graph is None:
@@ -330,9 +319,10 @@ def create_seed_population(num_seeds: int) -> list:
             try:
                 cheap = new_ind.evaluate_cheap(
                     objective_keys=CFG.CHEAP_OBJECTIVES,
-                    input_size=(1, 3, 32, 32),
+                    input_size=CFG.INPUT_SIZE,
                 )
-                if cheap.get("params", 0) <= CFG.MAX_PARAMS:
+                param_count = cheap.get("params", 0)
+                if param_count <= CFG.MAX_PARAMS:
                     graphs.append(new_graph)
                     break
             except Exception:
@@ -345,96 +335,11 @@ def create_seed_population(num_seeds: int) -> list:
 
 
 # =============================================================================
-# GPU setup helper
-# =============================================================================
-
-def _configure_gpu(cfg) -> str:
-    """
-    Detect GPU, apply cuDNN settings, auto-adjust batch size if VRAM is small.
-    Returns the device string ("cuda" or "cpu").
-    """
-    if not torch.cuda.is_available():
-        cfg.USE_AMP          = False
-        cfg.CUDNN_BENCHMARK  = False
-        cfg.PIN_MEMORY       = False
-        n_cpu = os.cpu_count() or 1
-        print(f"\n  No GPU detected — using CPU ({n_cpu} cores, parallel training)\n")
-        return "cpu"
-
-    device   = "cuda"
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_props = torch.cuda.get_device_properties(0)
-    vram_gb  = gpu_props.total_memory / 1e9
-    cuda_ver = torch.version.cuda or "unknown"
-
-    # ── cuDNN benchmark ────────────────────────────────────────────────────
-    # This is the single biggest laptop-GPU optimisation for fixed-size inputs.
-    # It runs once at startup and caches the best algorithm for each op shape.
-    torch.backends.cudnn.benchmark    = cfg.CUDNN_BENCHMARK
-    torch.backends.cudnn.deterministic = False   # required for benchmark mode
-
-    # ── AMP safety ────────────────────────────────────────────────────────
-    # AMP requires compute capability >= 7.0 (Volta+). Older cards (GTX 900/
-    # 1000 series, compute 6.x) don't have Tensor Cores; AMP still works but
-    # gives no speedup and can cause NaN on some old drivers.
-    cc_major = gpu_props.major
-    if cc_major < 7:
-        cfg.USE_AMP = False
-        amp_note = f"DISABLED (GPU compute capability {cc_major}.x < 7.0)"
-    else:
-        amp_note = "ENABLED" if cfg.USE_AMP else "DISABLED by config"
-
-    # ── VRAM-aware batch-size guard ────────────────────────────────────────
-    # Prevent OOM on small laptop GPUs by automatically capping BATCH_SIZE.
-    # The user can always increase it manually in config.py.
-    if cfg.TARGET_DATASET in ("CIFAR-10", "CIFAR-100"):
-        vram_to_max_batch = {4: 64, 6: 128, 8: 256, 12: 512}
-        recommended = 64
-        for vram_thresh, bs in sorted(vram_to_max_batch.items()):
-            if vram_gb >= vram_thresh:
-                recommended = bs
-        if cfg.BATCH_SIZE > recommended:
-            old_bs = cfg.BATCH_SIZE
-            cfg.BATCH_SIZE = recommended
-            print(f"  [Auto] BATCH_SIZE reduced {old_bs} → {recommended} "
-                  f"for {vram_gb:.1f} GB VRAM.")
-
-    print(f"\n{'='*58}")
-    print(f"  GPU : {gpu_name}")
-    print(f"  VRAM: {vram_gb:.1f} GB   |   CUDA {cuda_ver}")
-    print(f"  Compute cap: {gpu_props.major}.{gpu_props.minor}   |   "
-          f"SM count: {gpu_props.multi_processor_count}")
-    print(f"  AMP (fp16)       : {amp_note}")
-    print(f"  cuDNN benchmark  : {'ON' if cfg.CUDNN_BENCHMARK else 'OFF'}")
-    print(f"  Batch size       : {cfg.BATCH_SIZE}")
-    print(f"  DL workers       : {cfg.NUM_DATALOADER_WORKERS}"
-          f"{'  (auto=0 on Windows)' if _IS_WINDOWS else ''}")
-    print(f"  Pin memory       : {cfg.PIN_MEMORY}")
-    print(f"  Training strategy: Sequential on GPU")
-    print(f"{'='*58}\n")
-
-    logger.info(
-        "GPU=%s VRAM=%.1fGB CUDA=%s cc=%d.%d AMP=%s benchmark=%s",
-        gpu_name, vram_gb, cuda_ver,
-        gpu_props.major, gpu_props.minor,
-        cfg.USE_AMP, cfg.CUDNN_BENCHMARK,
-    )
-
-    return device
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    # ------------------------------------------------------------------
-    # GPU detection + cuDNN configuration
-    # ------------------------------------------------------------------
-    device = _configure_gpu(CFG)
-
-    logger.info("Starting LEMONADE NAS | dataset=%s device=%s",
-                CFG.TARGET_DATASET, device)
+    logger.info("Starting LEMONADE NAS on %s", CFG.TARGET_DATASET)
     logger.info("Config: %s", CFG)
 
     # ------------------------------------------------------------------
@@ -446,13 +351,24 @@ def main():
     logger.info("Run directory: %s", run_dir)
 
     # ------------------------------------------------------------------
-    # Data loaders for main process
+    # Device
+    # ------------------------------------------------------------------
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Device: %s", device)
+
+    print(f"\n  Dataset  : {CFG.TARGET_DATASET}")
+    print(f"  Classes  : {CFG.NUM_CLASSES}")
+    print(f"  Input    : {CFG.INPUT_SIZE}")
+    print(f"  Batch    : {CFG.BATCH_SIZE}")
+    print(f"  Device   : {device}\n")
+
+    # ------------------------------------------------------------------
+    # Data loaders  (main process only — workers load their own)
     # ------------------------------------------------------------------
     from data.loader_factory import get_loaders
-    loaders      = get_loaders(CFG, split_test=True)
-    train_loader = loaders[0]
-    val_loader   = loaders[1]
-    test_loader  = loaders[2] if len(loaders) > 2 else None
+    loaders = get_loaders(CFG, split_test=True)
+    train_loader, val_loader = loaders[0], loaders[1]
+    test_loader = loaders[2] if len(loaders) > 2 else None
 
     # ------------------------------------------------------------------
     # Seed population
@@ -476,25 +392,28 @@ def main():
     # ------------------------------------------------------------------
     history_dir = os.path.join(run_dir, "history")
     os.makedirs(history_dir, exist_ok=True)
-    with open(os.path.join(history_dir, "history.pkl"), "wb") as f:
+    history_path = os.path.join(history_dir, "history.pkl")
+    with open(history_path, "wb") as f:
         pickle.dump(history, f)
-    with open(os.path.join(run_dir, "config.pkl"), "wb") as f:
+    logger.info("History saved → %s", history_path)
+
+    config_path = os.path.join(run_dir, "config.pkl")
+    with open(config_path, "wb") as f:
         pickle.dump(CFG, f)
-    logger.info("History + config saved to %s", run_dir)
 
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
     plot_dir = os.path.join(run_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
+
     from utils.plot import plot_all_pairs, plot_3d_pareto, plot_convergence
-    plot_all_pairs(history, cheap_objectives=CFG.CHEAP_OBJECTIVES,
-                   save_dir=plot_dir)
-    plot_3d_pareto(history,  save_dir=plot_dir)
+    plot_all_pairs(history, cheap_objectives=CFG.CHEAP_OBJECTIVES, save_dir=plot_dir)
+    plot_3d_pareto(history, save_dir=plot_dir)
     plot_convergence(history, save_dir=plot_dir)
 
     # ------------------------------------------------------------------
-    # Final summary
+    # Final test evaluation
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print(f"  LEMONADE COMPLETE — {CFG.TARGET_DATASET}")
@@ -502,38 +421,34 @@ def main():
     print("=" * 60)
 
     for i, ind in enumerate(final_population):
-        ve = ind.f_exp.get("val_error")  if ind.f_exp   else None
-        p  = ind.f_cheap.get("params")   if ind.f_cheap else None
-        fl = ind.f_cheap.get("flops")    if ind.f_cheap else None
+        ve = ind.f_exp.get("val_error") if ind.f_exp else None
+        p  = ind.f_cheap.get("params")  if ind.f_cheap else None
+        fl = ind.f_cheap.get("flops")   if ind.f_cheap else None
 
         te = None
         if test_loader is not None and ind.model is not None:
             from train.evaluate import evaluate_accuracy
-            te = evaluate_accuracy(ind.model, test_loader,
-                                   device=device, use_amp=CFG.USE_AMP)
+            te = evaluate_accuracy(ind.model, test_loader, device=device)
 
+        logger.info(
+            "Final model %d | id=%s params=%s flops=%s val_err=%s test_err=%s",
+            i, ind.id,
+            f"{p:,}"        if p  is not None else "?",
+            f"{int(fl):,}"  if fl is not None else "?",
+            f"{ve:.4f}"     if ve is not None else "?",
+            f"{te:.4f}"     if te is not None else "?",
+        )
         p_str  = f"{p:>12,}"       if p  is not None else f"{'?':>12}"
         fl_str = f"{int(fl):>14,}" if fl is not None else f"{'?':>14}"
         ve_str = f"{ve:.4f}"       if ve is not None else "?"
         te_str = f"{te:.4f}"       if te is not None else "N/A"
         print(f"  [{i}] params={p_str}  flops={fl_str}  "
               f"val_err={ve_str}  test_err={te_str}")
-        logger.info(
-            "Final model %d | params=%s flops=%s val_err=%s test_err=%s",
-            i, p_str.strip(), fl_str.strip(), ve_str, te_str,
-        )
 
     print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
-    # Windows requires "spawn"; Linux/Mac default is "fork" which is fine.
-    # force=False means: only set if not already set (safe to call multiple times).
-    try:
-        multiprocessing.set_start_method("spawn", force=False)
-    except RuntimeError:
-        pass   # already set — ignore
-
     main()
 
 ================================================================================
@@ -1048,6 +963,9 @@ PATH:   .\data\cifar10.py
 ################################################################################
 
 # data/cifar10.py
+# Auto-download: YES  (~170 MB, torchvision)
+# Input: 32x32   Classes: 10   Batch: 128
+
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -1055,17 +973,12 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 
-def get_cifar_loaders(batch_size=128, num_workers=0, pin_memory=False,
-                      split_test=False, fast_dev_mode=True):
+def get_cifar_loaders(batch_size=128, num_workers=0, split_test=True,
+                      fast_dev_mode=False):
     """
-    Returns CIFAR-10 data loaders.
-
-    Parameters
-    ----------
-    num_workers  : prefetch workers (use 2 on Colab GPU, 0 on CPU-only / Windows)
-    pin_memory   : pin CPU tensors for fast GPU transfers (True when CUDA available)
-    split_test   : if True, returns (train, val, test); else (train, test)
-    fast_dev_mode: if True, uses ~10% of data for quick iteration
+    Returns (train_loader, val_loader, test_loader).
+    fast_dev_mode: uses 4500 train + 500 val images.
+    Full mode    : uses 45000 train + 5000 val images.
     """
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -1074,66 +987,40 @@ def get_cifar_loaders(batch_size=128, num_workers=0, pin_memory=False,
         transforms.Normalize((0.4914, 0.4822, 0.4465),
                              (0.2470, 0.2435, 0.2616)),
     ])
-
-    transform_test = transforms.Compose([
+    transform_val = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
                              (0.2470, 0.2435, 0.2616)),
     ])
 
-    # persistent_workers speeds up multi-worker loaders by keeping worker
-    # processes alive between epochs instead of respawning them.
-    persistent = (num_workers > 0)
+    pin_mem = torch.cuda.is_available() and num_workers > 0
 
-    def make_loader(dataset, shuffle):
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent,
-            drop_last=False,
-        )
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
 
-    if split_test:
-        train_data_full = torchvision.datasets.CIFAR10(
-            root="./data", train=True, download=True, transform=transform_train)
-        val_data_full = torchvision.datasets.CIFAR10(
-            root="./data", train=True, download=True, transform=transform_test)
+    train_full = torchvision.datasets.CIFAR10(
+        root="./data", train=True, download=True, transform=transform_train)
+    val_full = torchvision.datasets.CIFAR10(
+        root="./data", train=True, download=True, transform=transform_val)
 
-        indices = list(range(len(train_data_full)))
-        np.random.seed(42)
-        np.random.shuffle(indices)
+    indices = list(range(len(train_full)))
+    np.random.seed(42)
+    np.random.shuffle(indices)
 
-        if fast_dev_mode:
-            train_idx, val_idx = indices[:4500], indices[4500:5000]
-        else:
-            train_idx, val_idx = indices[:45000], indices[45000:]
-
-        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
-        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
-
-        testset     = torchvision.datasets.CIFAR10(
-            root="./data", train=False, download=True, transform=transform_test)
-        testloader  = make_loader(testset, shuffle=False)
-
-        return trainloader, valloader, testloader
-
+    if fast_dev_mode:
+        train_idx, val_idx = indices[:4500], indices[4500:5000]
     else:
-        trainset = torchvision.datasets.CIFAR10(
-            root="./data", train=True, download=True, transform=transform_train)
-        testset  = torchvision.datasets.CIFAR10(
-            root="./data", train=False, download=True, transform=transform_test)
+        train_idx, val_idx = indices[:45000], indices[45000:]
 
-        if fast_dev_mode:
-            n = len(trainset)
-            trainset = Subset(trainset, list(range(int(0.1 * n))))
+    test_ds = torchvision.datasets.CIFAR10(
+        root="./data", train=False, download=True, transform=transform_val)
 
-        trainloader = make_loader(trainset, shuffle=True)
-        testloader  = make_loader(testset,  shuffle=False)
-
-        return trainloader, testloader
+    return (
+        _loader(Subset(train_full, train_idx), shuffle=True),
+        _loader(Subset(val_full,   val_idx),   shuffle=False),
+        _loader(test_ds,                       shuffle=False),
+    )
 
 ================================================================================
 END OF: data/cifar10.py
@@ -1147,6 +1034,9 @@ PATH:   .\data\cifar100.py
 ################################################################################
 
 # data/cifar100.py
+# Auto-download: YES  (~170 MB, torchvision)
+# Input: 32x32   Classes: 100   Batch: 128
+
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -1154,17 +1044,12 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 
-def get_cifar100_loaders(batch_size=128, num_workers=0, pin_memory=False,
-                         split_test=False, fast_dev_mode=True):
+def get_cifar100_loaders(batch_size=128, num_workers=0, split_test=True,
+                         fast_dev_mode=False):
     """
-    Returns CIFAR-100 data loaders.
-
-    Parameters
-    ----------
-    num_workers  : prefetch workers (use 2 on Colab GPU, 0 on CPU-only / Windows)
-    pin_memory   : pin CPU tensors for fast GPU transfers (True when CUDA available)
-    split_test   : if True, returns (train, val, test); else (train, test)
-    fast_dev_mode: if True, uses ~10% of data for quick iteration
+    Returns (train_loader, val_loader, test_loader).
+    fast_dev_mode: uses 4500 train + 500 val images.
+    Full mode    : uses 45000 train + 5000 val images.
     """
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -1173,67 +1058,580 @@ def get_cifar100_loaders(batch_size=128, num_workers=0, pin_memory=False,
         transforms.Normalize((0.5071, 0.4865, 0.4409),
                              (0.2673, 0.2564, 0.2762)),
     ])
-
-    transform_test = transforms.Compose([
+    transform_val = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4865, 0.4409),
                              (0.2673, 0.2564, 0.2762)),
     ])
 
-    persistent = (num_workers > 0)
+    pin_mem = torch.cuda.is_available() and num_workers > 0
 
-    def make_loader(dataset, shuffle):
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent,
-            drop_last=False,
-        )
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
 
-    if split_test:
-        train_data_full = torchvision.datasets.CIFAR100(
-            root="./data", train=True, download=True, transform=transform_train)
-        val_data_full = torchvision.datasets.CIFAR100(
-            root="./data", train=True, download=True, transform=transform_test)
+    train_full = torchvision.datasets.CIFAR100(
+        root="./data", train=True, download=True, transform=transform_train)
+    val_full = torchvision.datasets.CIFAR100(
+        root="./data", train=True, download=True, transform=transform_val)
 
-        indices = list(range(len(train_data_full)))
-        np.random.seed(42)
-        np.random.shuffle(indices)
+    indices = list(range(len(train_full)))
+    np.random.seed(42)
+    np.random.shuffle(indices)
 
-        if fast_dev_mode:
-            train_idx, val_idx = indices[:4500], indices[4500:5000]
-        else:
-            train_idx, val_idx = indices[:45000], indices[45000:]
-
-        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
-        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
-
-        testset    = torchvision.datasets.CIFAR100(
-            root="./data", train=False, download=True, transform=transform_test)
-        testloader = make_loader(testset, shuffle=False)
-
-        return trainloader, valloader, testloader
-
+    if fast_dev_mode:
+        train_idx, val_idx = indices[:4500], indices[4500:5000]
     else:
-        trainset = torchvision.datasets.CIFAR100(
-            root="./data", train=True, download=True, transform=transform_train)
-        testset  = torchvision.datasets.CIFAR100(
-            root="./data", train=False, download=True, transform=transform_test)
+        train_idx, val_idx = indices[:45000], indices[45000:]
 
-        if fast_dev_mode:
-            n = len(trainset)
-            trainset = Subset(trainset, list(range(int(0.1 * n))))
+    test_ds = torchvision.datasets.CIFAR100(
+        root="./data", train=False, download=True, transform=transform_val)
 
-        trainloader = make_loader(trainset, shuffle=True)
-        testloader  = make_loader(testset,  shuffle=False)
-
-        return trainloader, testloader
+    return (
+        _loader(Subset(train_full, train_idx), shuffle=True),
+        _loader(Subset(val_full,   val_idx),   shuffle=False),
+        _loader(test_ds,                       shuffle=False),
+    )
 
 ================================================================================
 END OF: data/cifar100.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   cinic10.py
+PATH:   .\data\cinic10.py
+################################################################################
+
+# data/cinic10.py
+# =============================================================================
+# CINIC-10: CIFAR-10 + ImageNet hybrid benchmark
+# Auto-download: YES  (~426 MB from Zenodo)
+# Input: 32x32   Classes: 10   Batch: 128
+#
+# CINIC-10 extends CIFAR-10 by mixing in ImageNet images downsampled to 32x32.
+# It has 270,000 images total: 90,000 each in train/valid/test.
+# Classes are the same 10 as CIFAR-10.
+#
+# Reference: Darlow et al., CINIC-10 Is Not ImageNet or CIFAR-10, 2018.
+# =============================================================================
+
+import os
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+import numpy as np
+from utils.logger import get_logger
+
+logger = get_logger("cinic10", logfile="logs/cinic10.log")
+
+_ROOT = "./data/CINIC-10"
+
+# Zenodo public archive — stable academic URL
+_DOWNLOAD_URL = "https://datashare.ed.ac.uk/download/DS_10283_3192.zip"
+_FILENAME     = "CINIC-10.zip"
+
+# Same class names and mean/std as CIFAR-10 (images are pixel-compatible)
+_CINIC_MEAN = (0.47889522, 0.47227842, 0.43047404)
+_CINIC_STD  = (0.24205776, 0.23828046, 0.25874835)
+
+
+def _ensure_downloaded(root: str) -> None:
+    """Download and extract CINIC-10 if not already present."""
+    train_dir = os.path.join(root, "train")
+    if os.path.isdir(train_dir):
+        return  # already extracted
+
+    logger.info("CINIC-10 not found at %s — downloading (~426 MB)...", root)
+    os.makedirs("./data", exist_ok=True)
+
+    try:
+        from torchvision.datasets.utils import download_and_extract_archive
+        download_and_extract_archive(
+            url=_DOWNLOAD_URL,
+            download_root="./data",
+            extract_root="./data",
+            filename=_FILENAME,
+            remove_finished=False,  # keep zip in case re-extraction needed
+        )
+        logger.info("CINIC-10 downloaded and extracted to %s", root)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to auto-download CINIC-10: {e}\n\n"
+            "Manual download:\n"
+            "  1. Download: https://datashare.ed.ac.uk/download/DS_10283_3192.zip\n"
+            "  2. Extract to ./data/ so you have ./data/CINIC-10/train/ etc.\n"
+        ) from e
+
+
+def get_cinic10_loaders(batch_size=128, num_workers=0, split_test=True,
+                        fast_dev_mode=False, root=_ROOT):
+    """
+    Returns (train_loader, val_loader, test_loader).
+
+    CINIC-10 has official train/valid/test splits (90k each).
+    fast_dev_mode: uses 9000 train + 2000 valid samples.
+    """
+    _ensure_downloaded(root)
+
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(_CINIC_MEAN, _CINIC_STD),
+    ])
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(_CINIC_MEAN, _CINIC_STD),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    # CINIC-10 uses "valid" not "val"
+    train_ds = torchvision.datasets.ImageFolder(
+        os.path.join(root, "train"), transform=transform_train)
+    val_ds   = torchvision.datasets.ImageFolder(
+        os.path.join(root, "valid"), transform=transform_val)
+    test_ds  = torchvision.datasets.ImageFolder(
+        os.path.join(root, "test"),  transform=transform_val)
+
+    if fast_dev_mode:
+        np.random.seed(42)
+        train_idx = np.random.choice(len(train_ds), size=9000, replace=False).tolist()
+        val_idx   = np.random.choice(len(val_ds),   size=2000, replace=False).tolist()
+        train_ds  = Subset(train_ds, train_idx)
+        val_ds    = Subset(val_ds,   val_idx)
+
+    return (
+        _loader(train_ds, shuffle=True),
+        _loader(val_ds,   shuffle=False),
+        _loader(test_ds,  shuffle=False),
+    )
+
+================================================================================
+END OF: data/cinic10.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   coco_cls.py
+PATH:   .\data\coco_cls.py
+################################################################################
+
+# data/coco_cls.py
+# =============================================================================
+# MS COCO 2017 as single-label image classification
+# Auto-download: NO  (~20 GB images + pycocotools required)
+# Input: 224x224   Classes: 80   Batch: 32
+#
+# SETUP (one-time):
+# ─────────────────
+# 1. Install pycocotools:
+#      pip install pycocotools          # Linux / Mac
+#      pip install pycocotools-windows  # Windows
+#
+# 2. Download COCO 2017 (~20 GB):
+#      mkdir -p ./data/coco/images ./data/coco/annotations
+#
+#      # Images
+#      wget http://images.cocodataset.org/zips/train2017.zip   # ~18 GB
+#      wget http://images.cocodataset.org/zips/val2017.zip     # ~1 GB
+#      unzip train2017.zip -d ./data/coco/images/
+#      unzip val2017.zip   -d ./data/coco/images/
+#
+#      # Annotations
+#      wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+#      unzip annotations_trainval2017.zip -d ./data/coco/
+#
+#   Final structure:
+#      ./data/coco/images/train2017/*.jpg
+#      ./data/coco/images/val2017/*.jpg
+#      ./data/coco/annotations/instances_train2017.json
+#      ./data/coco/annotations/instances_val2017.json
+#
+# CLASSIFICATION STRATEGY:
+# ─────────────────────────
+# COCO is a multi-label detection dataset. We convert it to single-label
+# classification by assigning each image the category of the annotation
+# with the largest bounding-box area.
+# =============================================================================
+
+import os
+import torch
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+from PIL import Image
+import numpy as np
+from utils.logger import get_logger
+
+logger = get_logger("coco_cls", logfile="logs/coco_cls.log")
+
+_COCO_ROOT  = "./data/coco"
+_TRAIN_IMGS = os.path.join(_COCO_ROOT, "images",      "train2017")
+_VAL_IMGS   = os.path.join(_COCO_ROOT, "images",      "val2017")
+_TRAIN_ANN  = os.path.join(_COCO_ROOT, "annotations", "instances_train2017.json")
+_VAL_ANN    = os.path.join(_COCO_ROOT, "annotations", "instances_val2017.json")
+
+
+def _check_paths():
+    missing = []
+    for path, label in [
+        (_TRAIN_IMGS, "train images"), (_VAL_IMGS, "val images"),
+        (_TRAIN_ANN, "train annotations"), (_VAL_ANN, "val annotations"),
+    ]:
+        if not os.path.exists(path):
+            missing.append(f"  MISSING: {path}  ({label})")
+    if missing:
+        raise FileNotFoundError(
+            "COCO dataset not found. Missing files:\n"
+            + "\n".join(missing)
+            + "\n\nSee setup instructions at the top of data/coco_cls.py"
+        )
+
+
+class COCOClassification(Dataset):
+    """Single-label COCO: assigns each image the class of its largest annotation."""
+
+    def __init__(self, img_dir, ann_file, transform=None):
+        try:
+            from pycocotools.coco import COCO
+        except ImportError:
+            raise ImportError(
+                "pycocotools is required for COCO.\n"
+                "  pip install pycocotools          # Linux / Mac\n"
+                "  pip install pycocotools-windows  # Windows"
+            )
+
+        self.img_dir   = img_dir
+        self.transform = transform
+        coco           = COCO(ann_file)
+
+        cat_ids         = sorted(coco.getCatIds())
+        self.cat_to_idx = {c: i for i, c in enumerate(cat_ids)}
+        self.num_classes = len(cat_ids)
+
+        self.samples = []
+        for img_id in coco.imgs:
+            ann_ids = coco.getAnnIds(imgIds=img_id)
+            if not ann_ids:
+                continue
+            anns  = coco.loadAnns(ann_ids)
+            best  = max(anns, key=lambda a: a.get("area", 0))
+            label = self.cat_to_idx.get(best["category_id"])
+            if label is None:
+                continue
+            fname    = coco.imgs[img_id]["file_name"]
+            img_path = os.path.join(img_dir, fname)
+            if os.path.exists(img_path):
+                self.samples.append((img_path, label))
+
+        logger.info("COCOClassification: %d images, %d classes",
+                    len(self.samples), self.num_classes)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+def get_coco_loaders(batch_size=32, num_workers=0, split_test=True,
+                     fast_dev_mode=False):
+    """
+    Returns (train_loader, val_loader, test_loader).
+    fast_dev_mode: 2000 train + 500 val images.
+    """
+    _check_paths()   # raises clear error if data is missing
+
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    transform_val = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    train_ds = COCOClassification(_TRAIN_IMGS, _TRAIN_ANN, transform_train)
+    val_ds   = COCOClassification(_VAL_IMGS,   _VAL_ANN,   transform_val)
+
+    if fast_dev_mode:
+        np.random.seed(42)
+        t_idx = np.random.choice(len(train_ds), size=min(2000, len(train_ds)),
+                                 replace=False).tolist()
+        v_idx = np.random.choice(len(val_ds),   size=min(500,  len(val_ds)),
+                                 replace=False).tolist()
+        train_ds = Subset(train_ds, t_idx)
+        val_ds   = Subset(val_ds,   v_idx)
+
+    return (
+        _loader(train_ds, shuffle=True),
+        _loader(val_ds,   shuffle=False),
+        _loader(val_ds,   shuffle=False),   # no separate test split
+    )
+
+================================================================================
+END OF: data/coco_cls.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   eurosat.py
+PATH:   .\data\eurosat.py
+################################################################################
+
+# data/eurosat.py
+# =============================================================================
+# EuroSAT: European Sentinel-2 Satellite Imagery Classification
+# Auto-download: YES  (~90 MB, via torchvision.datasets.EuroSAT)
+# Input: 64x64   Classes: 10   Batch: 64
+#
+# 27,000 RGB images at 64x64 across 10 land-use / land-cover classes:
+#   AnnualCrop, Forest, HerbaceousVegetation, Highway, Industrial,
+#   Pasture, PermanentCrop, Residential, River, SeaLake
+#
+# No official train/val/test split — we do a 70/15/15 stratified split.
+# =============================================================================
+
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+import numpy as np
+from utils.logger import get_logger
+
+logger = get_logger("eurosat", logfile="logs/eurosat.log")
+
+# EuroSAT RGB statistics (computed from the full dataset)
+_MEAN = (0.3444, 0.3803, 0.4078)
+_STD  = (0.2028, 0.1366, 0.1153)
+
+
+def _stratified_split(dataset, val_frac=0.15, test_frac=0.15, seed=42):
+    """
+    Returns (train_indices, val_indices, test_indices) using stratified sampling
+    so each class is proportionally represented in every split.
+    """
+    np.random.seed(seed)
+
+    # Group indices by class label
+    class_indices = {}
+    for idx in range(len(dataset)):
+        # EuroSAT stores labels via .targets (list of ints)
+        label = dataset.targets[idx]
+        class_indices.setdefault(label, []).append(idx)
+
+    train_idx, val_idx, test_idx = [], [], []
+    for indices in class_indices.values():
+        indices = np.array(indices)
+        np.random.shuffle(indices)
+        n = len(indices)
+        n_val  = max(1, int(n * val_frac))
+        n_test = max(1, int(n * test_frac))
+        test_idx.extend(indices[:n_test].tolist())
+        val_idx.extend(indices[n_test:n_test + n_val].tolist())
+        train_idx.extend(indices[n_test + n_val:].tolist())
+
+    return train_idx, val_idx, test_idx
+
+
+def get_eurosat_loaders(batch_size=64, num_workers=0, split_test=True,
+                        fast_dev_mode=False):
+    """
+    Returns (train_loader, val_loader, test_loader).
+
+    fast_dev_mode: uses 2000 train + 500 val images.
+    Full mode    : full 27,000-image dataset with 70/15/15 stratified split.
+    """
+    transform_train = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    # torchvision.datasets.EuroSAT requires torchvision >= 0.11
+    try:
+        base_ds = torchvision.datasets.EuroSAT(
+            root="./data", download=True, transform=transform_val)
+    except AttributeError:
+        raise RuntimeError(
+            "torchvision.datasets.EuroSAT requires torchvision >= 0.11.\n"
+            f"Installed version: {torchvision.__version__}\n"
+            "Update with: pip install --upgrade torchvision"
+        )
+
+    # Check that .targets attribute exists (needed for stratified split)
+    if not hasattr(base_ds, "targets"):
+        # Older torchvision EuroSAT didn't expose .targets; build it manually
+        base_ds.targets = [base_ds[i][1] for i in range(len(base_ds))]
+
+    train_idx, val_idx, test_idx = _stratified_split(base_ds)
+
+    if fast_dev_mode:
+        np.random.seed(42)
+        train_idx = np.random.choice(train_idx, size=min(2000, len(train_idx)),
+                                     replace=False).tolist()
+        val_idx   = np.random.choice(val_idx,   size=min(500,  len(val_idx)),
+                                     replace=False).tolist()
+
+    # Train split gets augmented transforms; val/test get clean transforms
+    train_ds_aug = torchvision.datasets.EuroSAT(
+        root="./data", download=True, transform=transform_train)
+
+    logger.info("EuroSAT: train=%d  val=%d  test=%d",
+                len(train_idx), len(val_idx), len(test_idx))
+
+    return (
+        _loader(Subset(train_ds_aug, train_idx), shuffle=True),
+        _loader(Subset(base_ds,      val_idx),   shuffle=False),
+        _loader(Subset(base_ds,      test_idx),  shuffle=False),
+    )
+
+================================================================================
+END OF: data/eurosat.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   gtsrb.py
+PATH:   .\data\gtsrb.py
+################################################################################
+
+# data/gtsrb.py
+# =============================================================================
+# GTSRB: German Traffic Sign Recognition Benchmark
+# Auto-download: YES  (~300 MB, via torchvision.datasets.GTSRB)
+# Input: 32x32   Classes: 43   Batch: 128
+#
+# Original images vary in size (30x30 to 266x232).
+# We resize to 32x32 to keep the same input pipeline as CIFAR-based datasets.
+#
+# Train: 39,209 images   Test: 12,630 images
+# No official val split — we split 10% from train for validation.
+# =============================================================================
+
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+from utils.logger import get_logger
+
+logger = get_logger("gtsrb", logfile="logs/gtsrb.log")
+
+# GTSRB ImageNet-style normalisation (computed from the training set)
+_MEAN = (0.3403, 0.3121, 0.3214)
+_STD  = (0.2724, 0.2608, 0.2669)
+
+
+def get_gtsrb_loaders(batch_size=128, num_workers=0, split_test=True,
+                      fast_dev_mode=False):
+    """
+    Returns (train_loader, val_loader, test_loader).
+
+    fast_dev_mode: uses 4000 train + 800 val images.
+    Full mode    : splits the full 39,209-image train set 90/10 into train/val.
+    """
+    transform_train = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+    transform_val = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    # torchvision.datasets.GTSRB requires torchvision >= 0.12
+    try:
+        train_full = torchvision.datasets.GTSRB(
+            root="./data", split="train", download=True,
+            transform=transform_train)
+        # Duplicate for val (different transform)
+        val_full = torchvision.datasets.GTSRB(
+            root="./data", split="train", download=True,
+            transform=transform_val)
+        test_ds = torchvision.datasets.GTSRB(
+            root="./data", split="test", download=True,
+            transform=transform_val)
+    except AttributeError:
+        raise RuntimeError(
+            "torchvision.datasets.GTSRB requires torchvision >= 0.12.\n"
+            f"Installed version: {torchvision.__version__}\n"
+            "Update with: pip install --upgrade torchvision"
+        )
+
+    # Create 90/10 train/val split from the training set
+    n = len(train_full)
+    indices = list(range(n))
+    np.random.seed(42)
+    np.random.shuffle(indices)
+
+    if fast_dev_mode:
+        train_idx = indices[:4000]
+        val_idx   = indices[4000:4800]
+    else:
+        split = int(0.9 * n)
+        train_idx = indices[:split]
+        val_idx   = indices[split:]
+
+    logger.info("GTSRB: train=%d  val=%d  test=%d",
+                len(train_idx), len(val_idx), len(test_ds))
+
+    return (
+        _loader(Subset(train_full, train_idx), shuffle=True),
+        _loader(Subset(val_full,   val_idx),   shuffle=False),
+        _loader(test_ds,                       shuffle=False),
+    )
+
+================================================================================
+END OF: data/gtsrb.py
 ================================================================================
 
 
@@ -1243,7 +1641,12 @@ FILE:   imagenet.py
 PATH:   .\data\imagenet.py
 ################################################################################
 
-# data/imagenet.py
+################################################################################
+# FOLDER: data
+# FILE:   imagenet.py
+# PATH:   .\data\imagenet.py
+################################################################################
+
 import os
 import torch
 import torchvision
@@ -1254,98 +1657,74 @@ from utils.logger import get_logger
 
 logger = get_logger("imagenet_loader", logfile="logs/imagenet.log")
 
-
-def get_imagenet_loaders(batch_size=32, num_workers=0, pin_memory=False,
-                         split_test=False, fast_dev_mode=True):
-    """
-    Returns ImageNet data loaders.
-
-    Parameters
-    ----------
-    num_workers  : prefetch workers
-    pin_memory   : pin CPU tensors for fast GPU transfers
-    split_test   : if True, returns (train, val, test); else (train, test)
-    fast_dev_mode: if True, uses a small subset
-    """
+def get_imagenet_loaders(batch_size=32, num_workers=0, split_test=False, fast_dev_mode=True):
+    # ImageNet requires 224x224 input sizes and specific normalization
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
     transform_test = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    data_dir     = "./data/imagenet"
-    use_fake_data = not os.path.exists(os.path.join(data_dir, "train"))
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+    data_dir = './data/imagenet'
+    
+    # FALLBACK: If ImageNet is not downloaded (it is 150GB), use FakeData to test the pipeline safely
+    use_fake_data = not os.path.exists(os.path.join(data_dir, 'train'))
     if use_fake_data:
-        logger.warning("ImageNet not found at %s — using FakeData.", data_dir)
-        def dataset_class(is_train, transform):
-            return torchvision.datasets.FakeData(
-                size=5000 if is_train else 1000,
-                image_size=(3, 224, 224),
-                num_classes=1000,
-                transform=transform,
-            )
+        logger.warning("Real ImageNet files not found in ./data/imagenet/train. Using FakeData for architecture testing.")
+        dataset_class = lambda is_train, transform: torchvision.datasets.FakeData(
+            size=5000 if is_train else 1000, image_size=(3, 224, 224), num_classes=1000, transform=transform
+        )
     else:
-        def dataset_class(is_train, transform):
-            return torchvision.datasets.ImageFolder(
-                root=os.path.join(data_dir, "train" if is_train else "val"),
-                transform=transform,
-            )
-
-    persistent = (num_workers > 0)
-
-    def make_loader(dataset, shuffle):
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent,
-            drop_last=False,
+        dataset_class = lambda is_train, transform: torchvision.datasets.ImageFolder(
+            root=os.path.join(data_dir, 'train' if is_train else 'val'), transform=transform
         )
 
     if split_test:
-        train_data_full = dataset_class(is_train=True,  transform=transform_train)
-        val_data_full   = dataset_class(is_train=True,  transform=transform_test)
-
+        train_data_full = dataset_class(is_train=True, transform=transform_train)
+        val_data_full = dataset_class(is_train=True, transform=transform_test)
+        
         indices = list(range(len(train_data_full)))
-        np.random.seed(42)
+        np.random.seed(42)  
         np.random.shuffle(indices)
-
+        
         if fast_dev_mode:
             train_idx, val_idx = indices[:1000], indices[1000:1200]
         else:
+            # Standard 90/10 split of training data if real ImageNet
             split = int(0.9 * len(indices))
             train_idx, val_idx = indices[:split], indices[split:]
-
-        trainloader = make_loader(Subset(train_data_full, train_idx), shuffle=True)
-        valloader   = make_loader(Subset(val_data_full,   val_idx),   shuffle=False)
-
-        testset    = dataset_class(is_train=False, transform=transform_test)
-        testloader = make_loader(testset, shuffle=False)
-
+            
+        train_subset = Subset(train_data_full, train_idx)
+        val_subset = Subset(val_data_full, val_idx)
+        
+        trainloader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
+        valloader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+        
+        testset = dataset_class(is_train=False, transform=transform_test)
+        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+        
         return trainloader, valloader, testloader
 
     else:
-        trainset = dataset_class(is_train=True,  transform=transform_train)
-        testset  = dataset_class(is_train=False, transform=transform_test)
-
+        trainset = dataset_class(is_train=True, transform=transform_train)
+        testset = dataset_class(is_train=False, transform=transform_test)
+        
         if fast_dev_mode:
-            n = len(trainset)
-            trainset = Subset(trainset, list(range(int(0.1 * n))))
+            num_train = len(trainset)
+            indices = list(range(num_train))
+            trainset = Subset(trainset, indices[:int(0.1 * num_train)])
 
-        trainloader = make_loader(trainset, shuffle=True)
-        testloader  = make_loader(testset,  shuffle=False)
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
+        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
 
         return trainloader, testloader
 
@@ -1363,83 +1742,397 @@ PATH:   .\data\loader_factory.py
 # data/loader_factory.py
 # =============================================================================
 # Single entry-point for data loading.
+# Used by BOTH the main process and CPU worker sub-processes.
 #
-# get_loaders(cfg)           — main process: uses cfg.NUM_DATALOADER_WORKERS
-#                              and cfg.PIN_MEMORY for fast GPU data feeds.
-#
-# get_loaders_for_worker(cfg) — CPU subprocess workers: always num_workers=0
-#                               and pin_memory=False (nested MP is unsafe).
+# get_loaders(cfg)            → (train, val, test) for main process
+# get_loaders_for_worker(cfg) → (train, val)       for workers (num_workers=0)
 # =============================================================================
-import torch
 
 
 def get_loaders(cfg, split_test: bool = True):
     """
-    Return (train_loader, val_loader[, test_loader]) for the main process.
-
-    Uses cfg.NUM_DATALOADER_WORKERS prefetch workers and cfg.PIN_MEMORY for
-    fast CPU→GPU data transfers when CUDA is available.
+    Returns (train_loader, val_loader, test_loader) based on cfg.TARGET_DATASET.
+    Always returns a 3-tuple; test_loader may equal val_loader for datasets
+    without a separate labelled test split.
     """
     ds  = cfg.TARGET_DATASET
     bs  = cfg.BATCH_SIZE
     fdm = cfg.FAST_DEV_MODE
 
-    # pin_memory is only useful when CUDA is available
-    pin = cfg.PIN_MEMORY and torch.cuda.is_available()
-    nw  = cfg.NUM_DATALOADER_WORKERS if torch.cuda.is_available() else 0
+    if ds == "CIFAR-10":
+        from data.cifar10 import get_cifar_loaders
+        return get_cifar_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
 
-    if ds == "CIFAR-100":
+    elif ds == "CIFAR-100":
         from data.cifar100 import get_cifar100_loaders
         return get_cifar100_loaders(
-            batch_size=bs, num_workers=nw, pin_memory=pin,
-            split_test=split_test, fast_dev_mode=fdm,
-        )
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "CINIC-10":
+        from data.cinic10 import get_cinic10_loaders
+        return get_cinic10_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "GTSRB":
+        from data.gtsrb import get_gtsrb_loaders
+        return get_gtsrb_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "EUROSAT":
+        from data.eurosat import get_eurosat_loaders
+        return get_eurosat_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "TINY_IMAGENET":
+        from data.tiny_imagenet import get_tiny_imagenet_loaders
+        return get_tiny_imagenet_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
     elif ds == "IMAGENET":
         from data.imagenet import get_imagenet_loaders
         return get_imagenet_loaders(
-            batch_size=bs, num_workers=nw, pin_memory=pin,
-            split_test=split_test, fast_dev_mode=fdm,
-        )
-    else:  # default: CIFAR-10
-        from data.cifar10 import get_cifar_loaders
-        return get_cifar_loaders(
-            batch_size=bs, num_workers=nw, pin_memory=pin,
-            split_test=split_test, fast_dev_mode=fdm,
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "PLACES365":
+        from data.places365 import get_places365_loaders
+        return get_places365_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    elif ds == "COCO":
+        from data.coco_cls import get_coco_loaders
+        return get_coco_loaders(
+            batch_size=bs, num_workers=0,
+            split_test=split_test, fast_dev_mode=fdm)
+
+    else:
+        supported = [
+            "CIFAR-10", "CIFAR-100", "CINIC-10", "GTSRB", "EUROSAT",
+            "TINY_IMAGENET", "IMAGENET", "PLACES365", "COCO",
+        ]
+        raise ValueError(
+            f"Unknown dataset '{ds}'.\nSupported: {supported}"
         )
 
 
 def get_loaders_for_worker(cfg):
     """
-    Returns (train_loader, val_loader) for use inside a CPU subprocess worker.
-    Always uses num_workers=0 and pin_memory=False to avoid nested-MP crashes.
+    Returns (train_loader, val_loader) for use inside a CPU subprocess.
+    Always num_workers=0 to prevent nested multiprocessing crashes.
     """
-    ds  = cfg.TARGET_DATASET
-    bs  = cfg.BATCH_SIZE
-    fdm = cfg.FAST_DEV_MODE
-
-    if ds == "CIFAR-100":
-        from data.cifar100 import get_cifar100_loaders
-        result = get_cifar100_loaders(
-            batch_size=bs, num_workers=0, pin_memory=False,
-            split_test=True, fast_dev_mode=fdm,
-        )
-    elif ds == "IMAGENET":
-        from data.imagenet import get_imagenet_loaders
-        result = get_imagenet_loaders(
-            batch_size=bs, num_workers=0, pin_memory=False,
-            split_test=True, fast_dev_mode=fdm,
-        )
-    else:
-        from data.cifar10 import get_cifar_loaders
-        result = get_cifar_loaders(
-            batch_size=bs, num_workers=0, pin_memory=False,
-            split_test=True, fast_dev_mode=fdm,
-        )
-    # result is (train, val, test) — we only need train and val
+    result = get_loaders(cfg, split_test=True)
     return result[0], result[1]
 
 ================================================================================
 END OF: data/loader_factory.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   places365.py
+PATH:   .\data\places365.py
+################################################################################
+
+# data/places365.py
+# =============================================================================
+# Places365 Scene Recognition
+# Auto-download: YES (small 256px version, ~24 GB)
+# Input: 224x224   Classes: 365   Batch: 32
+#
+# The "small" version uses 256x256 images which torchvision can auto-download.
+# The standard (high-res) version is ~105 GB and requires manual download.
+#
+# NOTE: The first download takes a long time (~24 GB). Set FAST_DEV_MODE=True
+# while testing to limit training to a small subset and save time.
+# =============================================================================
+
+import os
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+from utils.logger import get_logger
+
+logger = get_logger("places365", logfile="logs/places365.log")
+
+_ROOT = "./data/places365"
+
+
+def get_places365_loaders(batch_size=32, num_workers=0, split_test=True,
+                          fast_dev_mode=False):
+    """
+    Returns (train_loader, val_loader, test_loader).
+
+    Uses small=True (256x256 pre-resized images) for auto-download.
+    fast_dev_mode: 3000 train + 600 val images (first download still needed).
+    """
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    transform_val = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    try:
+        train_ds = torchvision.datasets.Places365(
+            root=_ROOT, split="train-standard", small=True,
+            download=True, transform=transform_train)
+        val_ds   = torchvision.datasets.Places365(
+            root=_ROOT, split="val", small=True,
+            download=True, transform=transform_val)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Places365 failed to load/download: {exc}\n\n"
+            "If the download is stuck or fails, manual instructions:\n"
+            "  http://places2.csail.mit.edu/index.html → Download\n"
+            "  Extract to ./data/places365/\n"
+            "Or set small=False in data/places365.py for the full dataset "
+            "(not auto-downloadable, ~105 GB).\n"
+        ) from exc
+
+    if fast_dev_mode:
+        np.random.seed(42)
+        t_idx = np.random.choice(len(train_ds), size=min(3000, len(train_ds)),
+                                 replace=False).tolist()
+        v_idx = np.random.choice(len(val_ds),   size=min(600,  len(val_ds)),
+                                 replace=False).tolist()
+        train_ds = Subset(train_ds, t_idx)
+        val_ds   = Subset(val_ds,   v_idx)
+
+    logger.info("Places365: train=%d  val=%d",
+                len(train_ds), len(val_ds))
+
+    train_loader = _loader(train_ds, shuffle=True)
+    val_loader   = _loader(val_ds,   shuffle=False)
+
+    # Places365-standard val set has no separate test split → reuse val
+    return train_loader, val_loader, val_loader
+
+================================================================================
+END OF: data/places365.py
+================================================================================
+
+
+################################################################################
+FOLDER: data
+FILE:   tiny_imagenet.py
+PATH:   .\data\tiny_imagenet.py
+################################################################################
+
+# data/tiny_imagenet.py
+# =============================================================================
+# Tiny ImageNet-200
+# Auto-download: YES  (~235 MB from Stanford CS231n)
+# Input: 64x64   Classes: 200   Batch: 64
+#
+# Non-standard directory structure handled by custom Dataset classes:
+#   Train: class/images/*.JPEG  (class-per-folder + extra "images" subfolder)
+#   Val  : images/*.JPEG + val_annotations.txt  (flat folder + annotation file)
+# =============================================================================
+
+import os
+import shutil
+from pathlib import Path
+
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+from PIL import Image
+from utils.logger import get_logger
+
+logger = get_logger("tiny_imagenet", logfile="logs/tiny_imagenet.log")
+
+_ROOT         = "./data/tiny-imagenet-200"
+_DOWNLOAD_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+_FILENAME     = "tiny-imagenet-200.zip"
+
+_MEAN = (0.4802, 0.4481, 0.3975)
+_STD  = (0.2764, 0.2689, 0.2816)
+
+
+def _ensure_downloaded(root: str) -> None:
+    """Download and extract Tiny ImageNet if not already present."""
+    train_dir = os.path.join(root, "train")
+    if os.path.isdir(train_dir):
+        return  # already extracted
+
+    logger.info("Tiny ImageNet not found — downloading (~235 MB)...")
+    os.makedirs("./data", exist_ok=True)
+
+    try:
+        from torchvision.datasets.utils import download_and_extract_archive
+        download_and_extract_archive(
+            url=_DOWNLOAD_URL,
+            download_root="./data",
+            extract_root="./data",
+            filename=_FILENAME,
+            remove_finished=False,
+        )
+        logger.info("Tiny ImageNet downloaded and extracted to %s", root)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to auto-download Tiny ImageNet: {e}\n\n"
+            "Manual download:\n"
+            "  wget http://cs231n.stanford.edu/tiny-imagenet-200.zip\n"
+            "  unzip tiny-imagenet-200.zip -d ./data/\n"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Custom Dataset wrappers
+# ---------------------------------------------------------------------------
+
+class _TinyImageNetTrain(Dataset):
+    """
+    Reads training images from:
+        <root>/train/<class_id>/images/<img>.JPEG
+    """
+    def __init__(self, root: str, transform=None):
+        self.transform   = transform
+        self.samples     = []   # (path, class_idx)
+        self.class_to_idx = {}
+
+        train_dir  = Path(root) / "train"
+        class_dirs = sorted([d for d in train_dir.iterdir() if d.is_dir()])
+        for idx, class_dir in enumerate(class_dirs):
+            self.class_to_idx[class_dir.name] = idx
+            images_dir = class_dir / "images"
+            if images_dir.is_dir():
+                for img_path in sorted(images_dir.glob("*.JPEG")):
+                    self.samples.append((str(img_path), idx))
+
+        logger.info("TinyIN train: %d classes, %d images",
+                    len(class_dirs), len(self.samples))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+class _TinyImageNetVal(Dataset):
+    """
+    Reads validation images from:
+        <root>/val/images/<filename>.JPEG
+    with labels from:
+        <root>/val/val_annotations.txt  (tab-separated: filename, class_id, ...)
+    """
+    def __init__(self, root: str, class_to_idx: dict, transform=None):
+        self.transform = transform
+        self.samples   = []
+
+        val_dir    = Path(root) / "val"
+        images_dir = val_dir / "images"
+        ann_file   = val_dir / "val_annotations.txt"
+
+        with open(ann_file, "r") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 2:
+                    continue
+                filename, class_id = parts[0], parts[1]
+                if class_id not in class_to_idx:
+                    continue
+                img_path = images_dir / filename
+                if img_path.exists():
+                    self.samples.append((str(img_path),
+                                         class_to_idx[class_id]))
+
+        logger.info("TinyIN val: %d images", len(self.samples))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_tiny_imagenet_loaders(batch_size=64, num_workers=0, split_test=True,
+                               fast_dev_mode=False, root=_ROOT):
+    """
+    Returns (train_loader, val_loader, test_loader).
+
+    Tiny ImageNet has no labelled test set — test_loader reuses val_loader.
+    fast_dev_mode: 9000 train + 500 val images.
+    """
+    _ensure_downloaded(root)
+
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(64, padding=8),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(_MEAN, _STD),
+    ])
+
+    pin_mem = torch.cuda.is_available() and num_workers > 0
+
+    def _loader(ds, shuffle):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=pin_mem)
+
+    train_ds = _TinyImageNetTrain(root, transform=transform_train)
+    val_ds   = _TinyImageNetVal(root, train_ds.class_to_idx,
+                                transform=transform_val)
+
+    if fast_dev_mode:
+        np.random.seed(42)
+        t_idx = np.random.choice(len(train_ds), size=min(9000, len(train_ds)),
+                                 replace=False).tolist()
+        v_idx = np.random.choice(len(val_ds),   size=min(500,  len(val_ds)),
+                                 replace=False).tolist()
+        train_ds = Subset(train_ds, t_idx)
+        val_ds   = Subset(val_ds,   v_idx)
+
+    train_loader = _loader(train_ds, shuffle=True)
+    val_loader   = _loader(val_ds,   shuffle=False)
+
+    # No test labels → reuse val
+    return train_loader, val_loader, val_loader
+
+================================================================================
+END OF: data/tiny_imagenet.py
 ================================================================================
 
 
@@ -1465,7 +2158,7 @@ class Individual:
         self.model    = None        # set by build_model(); cleared before pickling
         self.f_cheap  = None        # dict: e.g. {"params": ..., "flops": ...}
         self.f_exp    = None        # dict: {"val_error": float}
-        self.op_name  = None        # set by lemonade loop ("exact" | "approx")
+        self.op_name  = None        # set by lemonade loop
         logger.debug("Created Individual %s", self.id)
 
     # ------------------------------------------------------------------
@@ -1475,8 +2168,14 @@ class Individual:
     def build_model(self, input_shape=(1, 3, 32, 32)) -> CompiledModel:
         """
         Build (once) or return the cached CompiledModel.
-        IMPORTANT: always use the returned reference — do not call
-        build_model() expecting a different object each time.
+
+        IMPORTANT:
+        - Always pass the correct input_shape for your dataset.
+          Use cfg.INPUT_SIZE everywhere, e.g.:
+              ind.build_model(input_shape=cfg.INPUT_SIZE)
+        - Do NOT call build_model() multiple times expecting different objects.
+          After the first call, self.model is cached and the same object is
+          returned every time (regardless of input_shape).
         """
         if self.model is None:
             logger.debug("Building CompiledModel for Individual %s", self.id)
@@ -1490,14 +2189,12 @@ class Individual:
     def evaluate_cheap(self, objective_keys=("params", "flops"),
                        input_size=(1, 3, 32, 32)):
         """
-        Compute cheap objectives.
+        Compute cheap objectives (cached after first call).
 
-        If objective_keys contains only "params" → uses fast graph-based
-        counter, NO model build required.
+        "params"  → fast graph-based count, NO model build required
+        "flops"   → builds model + runs thop (slower)
 
-        If objective_keys contains "flops" → builds model and runs thop.
-
-        Results are cached in self.f_cheap after the first call.
+        Always pass cfg.INPUT_SIZE as input_size for correctness.
         """
         if self.f_cheap is not None:
             return self.f_cheap
@@ -1520,7 +2217,7 @@ class Individual:
         return self.f_cheap
 
     # ------------------------------------------------------------------
-    # Expensive objective  (called inside worker processes)
+    # Expensive objective
     # ------------------------------------------------------------------
 
     def evaluate_expensive(self, train_loader, val_loader,
@@ -1528,9 +2225,8 @@ class Individual:
                            weight_decay=1e-4, optimizer_name="sgd",
                            show_progress=True):
         """
-        NOTE: This method is provided for completeness.
-        In practice, the lemonade worker calls train_model / evaluate_accuracy
-        directly on child.model to keep the model reference consistent.
+        Train + evaluate.  Called directly only in serial fallback; the normal
+        LEMONADE loop uses the worker function in lemonade_full.py instead.
         """
         if self.f_exp is not None:
             return self.f_exp
@@ -1566,25 +2262,9 @@ PATH:   .\evolution\lemonade_full.py
 
 # evolution/lemonade_full.py
 # =============================================================================
-# LEMONADE loop — GPU/CPU adaptive execution.
-#
-# GPU strategy (CUDA available):
-#   Models are trained ONE AT A TIME on the GPU in the main process.
-#   ┌─────────────────────────────────────────────────────────┐
-#   │  Why sequential on GPU beats parallel on CPU:           │
-#   │  • A single GPU forward/backward is 20-100x faster      │
-#   │    than a CPU pass — no parallelism needed.             │
-#   │  • No pickle/IPC overhead (models stay in main proc).   │
-#   │  • Dataset is loaded ONCE per generation, not once       │
-#   │    per model per worker.                                 │
-#   │  • CUDA cannot be forked to child processes safely.      │
-#   └─────────────────────────────────────────────────────────┘
-#
-# CPU strategy (no CUDA):
-#   Models are trained IN PARALLEL using ProcessPoolExecutor
-#   (same as before, one worker per CPU core).
-#
-# The loop logic (correct LEMONADE Algorithm 1 order) is unchanged.
+# LEMONADE loop — correct Algorithm 1 order.
+# All hardcoded (1,3,32,32) input sizes replaced with cfg.INPUT_SIZE so
+# every dataset (CIFAR-10/100, Tiny-ImageNet, Places365, COCO) works.
 # =============================================================================
 
 import os
@@ -1606,40 +2286,39 @@ error_logger = get_logger("lemonade_errors", logfile="logs/lemonade_errors.log")
 
 
 # =============================================================================
-# GPU path — train one child at a time in the main process
+# Worker function  (runs in a separate subprocess — no CUDA inside)
 # =============================================================================
 
-def _train_one_child_gpu(pc, cfg, train_epochs, train_lr,
-                         device, train_loader, val_loader):
+def _worker_train_child(idx, pickled_payload, cfg, train_epochs: int,
+                        train_lr: float):
     """
-    Train a single child on the GPU (main process, no pickling).
-
-    Parameters
-    ----------
-    pc           : bytes — pickled payload tuple
-    cfg          : NASConfig
-    train_epochs : int
-    train_lr     : float
-    device       : "cuda" or "cuda:N"
-    train_loader : DataLoader — shared across all children this generation
-    val_loader   : DataLoader — shared across all children this generation
-
-    Returns
-    -------
-    dict with keys: status, ind (Individual), error
+    Complete child lifecycle inside one worker process:
+      load graph → build model with CORRECT input shape → load inherited weights
+      → [distill if ANM] → standard training → evaluate → return.
     """
+    import os, gc, pickle, time, traceback
     import torch
-    from objectives.cheap import clean_state_dict
+
+    os.environ["TQDM_DISABLE"] = "1"
+    torch.set_num_threads(1)
 
     try:
+        start = time.time()
+
         child_graph, child_sd_path, parent_graph, parent_sd_path, is_approx = \
-            pickle.loads(pc)
+            pickle.loads(pickled_payload)
+
+        from objectives.cheap import clean_state_dict
+
+        # cfg.INPUT_SIZE is the correct shape for the current dataset
+        input_shape = tuple(cfg.INPUT_SIZE)
 
         # ------------------------------------------------------------------
-        # 1. Build child model ONCE (stays in main process — no CUDA fork)
+        # 1. Build child model ONCE with the CORRECT input shape
         # ------------------------------------------------------------------
-        child       = Individual(child_graph)
-        child_model = child.build_model()
+        from evolution.individual import Individual as _Ind
+        child       = _Ind(child_graph)
+        child_model = child.build_model(input_shape=input_shape)
 
         # ------------------------------------------------------------------
         # 2. Load Lamarckian inherited weights
@@ -1650,7 +2329,7 @@ def _train_one_child_gpu(pc, cfg, train_epochs, train_lr,
                                 weights_only=True)
                 child_model.load_state_dict(clean_state_dict(sd), strict=False)
             except Exception:
-                pass  # random init is fine
+                pass   # proceed with random init
             finally:
                 try:
                     os.remove(child_sd_path)
@@ -1658,204 +2337,13 @@ def _train_one_child_gpu(pc, cfg, train_epochs, train_lr,
                     pass
 
         # ------------------------------------------------------------------
-        # 3. Build teacher if ANM child (for distillation)
+        # 3. Build teacher model if ANM — also with correct input shape
         # ------------------------------------------------------------------
-        teacher_model = None
-        if is_approx and parent_graph is not None:
-            try:
-                teacher       = Individual(parent_graph)
-                teacher_model = teacher.build_model()
-                if parent_sd_path and os.path.exists(parent_sd_path):
-                    sd = torch.load(parent_sd_path, map_location="cpu",
-                                    weights_only=True)
-                    teacher_model.load_state_dict(clean_state_dict(sd),
-                                                  strict=False)
-                teacher_model.eval()
-                for p in teacher_model.parameters():
-                    p.requires_grad = False
-            except Exception:
-                teacher_model = None
-
-        # ------------------------------------------------------------------
-        # 4. Evaluate cheap objectives (graph-based, no GPU needed)
-        # ------------------------------------------------------------------
-        try:
-            child.evaluate_cheap(
-                objective_keys=cfg.CHEAP_OBJECTIVES,
-                input_size=(1, 3, 32, 32),
-            )
-        except Exception:
-            child.f_cheap = {k: 0 for k in cfg.CHEAP_OBJECTIVES}
-
-        # ------------------------------------------------------------------
-        # 5a. Distillation phase (ANM only)
-        #     Use DISTILL_EPOCHS + DISTILL_LR — separate from training.
-        # ------------------------------------------------------------------
-        if is_approx and teacher_model is not None:
-            try:
-                from train.distill import train_with_distillation
-                train_with_distillation(
-                    student_model  = child_model,
-                    teacher_model  = teacher_model,
-                    train_loader   = train_loader,
-                    device         = device,
-                    epochs         = cfg.DISTILL_EPOCHS,
-                    lr             = cfg.DISTILL_LR,
-                    temperature    = cfg.DISTILL_TEMPERATURE,
-                    alpha          = cfg.DISTILL_ALPHA,
-                    weight_decay   = cfg.WEIGHT_DECAY,
-                    optimizer_name = cfg.OPTIMIZER,
-                    show_progress  = False,   # no nested bars
-                    use_amp        = cfg.USE_AMP,
-                )
-            except Exception as e:
-                error_logger.error("Distillation failed %s: %s", child.id, e)
-            finally:
-                # Free teacher from GPU immediately after distillation
-                teacher_model.cpu()
-                del teacher_model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-        # ------------------------------------------------------------------
-        # 5b. Standard training (all children)
-        # ------------------------------------------------------------------
-        try:
-            from train.trainer import train_model
-            train_model(
-                model          = child_model,
-                train_loader   = train_loader,
-                device         = device,
-                epochs         = train_epochs,
-                lr             = train_lr,
-                weight_decay   = cfg.WEIGHT_DECAY,
-                optimizer_name = cfg.OPTIMIZER,
-                show_progress  = False,
-                use_amp        = cfg.USE_AMP,
-            )
-        except Exception as e:
-            error_logger.error("Training failed %s: %s", child.id, e)
-
-        # ------------------------------------------------------------------
-        # 6. Evaluate (AMP inference)
-        # ------------------------------------------------------------------
-        try:
-            from train.evaluate import evaluate_accuracy
-            val_error = evaluate_accuracy(child_model, val_loader,
-                                          device=device,
-                                          use_amp=cfg.USE_AMP)
-        except Exception:
-            val_error = 1.0
-
-        child.f_exp = {"val_error": val_error}
-
-        # ------------------------------------------------------------------
-        # 7. Move model back to CPU to free GPU memory for the next child
-        # ------------------------------------------------------------------
-        child_model.cpu()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        return {"status": "ok", "ind": child}
-
-    except Exception as exc:
-        return {
-            "status":    "error",
-            "error":     str(exc),
-            "traceback": traceback.format_exc(),
-        }
-
-
-def _sequential_train_gpu(payloads, cfg, train_epochs, train_lr,
-                           device, desc):
-    """
-    Train each child sequentially on the GPU.
-    Data loaders are created ONCE and shared across all children.
-    """
-    import torch
-    from data.loader_factory import get_loaders
-
-    # Create data loaders once for the whole batch
-    # Use full num_workers + pin_memory for GPU
-    loaders      = get_loaders(cfg, split_test=True)
-    train_loader = loaders[0]
-    val_loader   = loaders[1]
-
-    trained = []
-    n       = len(payloads)
-
-    if cfg.SHOW_PROGRESS_BAR:
-        try:
-            from tqdm import tqdm
-            iterator = tqdm(enumerate(payloads), total=n,
-                            desc=desc, unit="model")
-        except ImportError:
-            iterator = enumerate(payloads)
-    else:
-        iterator = enumerate(payloads)
-
-    for i, (idx, pc) in iterator:
-        result = _train_one_child_gpu(
-            pc, cfg, train_epochs, train_lr,
-            device, train_loader, val_loader,
-        )
-        if result["status"] == "ok":
-            trained.append(result["ind"])
-        else:
-            error_logger.error("%s child %d/%d error: %s\n%s",
-                               desc, i + 1, n,
-                               result.get("error"),
-                               result.get("traceback", ""))
-
-    return trained
-
-
-# =============================================================================
-# CPU path — parallel training via ProcessPoolExecutor (unchanged from before)
-# =============================================================================
-
-def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
-    """
-    Worker function for CPU-parallel training.
-    Runs in a subprocess — must not use CUDA.
-    """
-    import os, gc, pickle, time, traceback
-    import torch
-
-    os.environ["TQDM_DISABLE"] = "1"
-    torch.set_num_threads(1)
-
-    try:
-        start = time.time()
-        child_graph, child_sd_path, parent_graph, parent_sd_path, is_approx = \
-            pickle.loads(pickled_payload)
-
-        from objectives.cheap import clean_state_dict
-        from evolution.individual import Individual as _Ind
-
-        child       = _Ind(child_graph)
-        child_model = child.build_model()
-
-        if child_sd_path and os.path.exists(child_sd_path):
-            try:
-                sd = torch.load(child_sd_path, map_location="cpu",
-                                weights_only=True)
-                child_model.load_state_dict(clean_state_dict(sd), strict=False)
-            except Exception:
-                pass
-            finally:
-                try:
-                    os.remove(child_sd_path)
-                except OSError:
-                    pass
-
         teacher_model = None
         if is_approx and parent_graph is not None:
             try:
                 teacher       = _Ind(parent_graph)
-                teacher_model = teacher.build_model()
+                teacher_model = teacher.build_model(input_shape=input_shape)
                 if parent_sd_path and os.path.exists(parent_sd_path):
                     sd = torch.load(parent_sd_path, map_location="cpu",
                                     weights_only=True)
@@ -1867,19 +2355,28 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
             except Exception:
                 teacher_model = None
 
+        # ------------------------------------------------------------------
+        # 4. Evaluate cheap objectives (uses correct input_size)
+        # ------------------------------------------------------------------
         try:
             child.evaluate_cheap(
                 objective_keys=cfg.CHEAP_OBJECTIVES,
-                input_size=(1, 3, 32, 32),
+                input_size=input_shape,
             )
         except Exception:
             child.f_cheap = {k: 0 for k in cfg.CHEAP_OBJECTIVES}
 
+        # ------------------------------------------------------------------
+        # 5. Load dataset (correct dataset based on cfg)
+        # ------------------------------------------------------------------
         from data.loader_factory import get_loaders_for_worker
         train_loader_w, val_loader_w = get_loaders_for_worker(cfg)
 
-        device = "cpu"  # workers MUST use CPU
+        device = "cpu"  # workers MUST use CPU (avoids CUDA fork issues)
 
+        # ------------------------------------------------------------------
+        # 6a. Distillation phase  (ANM only)
+        # ------------------------------------------------------------------
         if is_approx and teacher_model is not None:
             try:
                 from train.distill import train_with_distillation
@@ -1895,14 +2392,17 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
                     weight_decay   = cfg.WEIGHT_DECAY,
                     optimizer_name = cfg.OPTIMIZER,
                     show_progress  = False,
-                    use_amp        = False,  # no AMP on CPU
                 )
             except Exception as e:
-                error_logger.error("Distillation failed %s: %s", child.id, e)
+                error_logger.error("Distillation failed for %s: %s",
+                                   child.id, e)
             finally:
                 del teacher_model
                 gc.collect()
 
+        # ------------------------------------------------------------------
+        # 6b. Standard training phase
+        # ------------------------------------------------------------------
         try:
             from train.trainer import train_model
             train_model(
@@ -1914,26 +2414,30 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
                 weight_decay   = cfg.WEIGHT_DECAY,
                 optimizer_name = cfg.OPTIMIZER,
                 show_progress  = False,
-                use_amp        = False,
             )
         except Exception as e:
-            error_logger.error("Training failed %s: %s", child.id, e)
+            error_logger.error("Training failed for %s: %s", child.id, e)
 
+        # ------------------------------------------------------------------
+        # 7. Evaluate accuracy
+        # ------------------------------------------------------------------
         try:
             from train.evaluate import evaluate_accuracy
             val_error = evaluate_accuracy(child_model, val_loader_w,
-                                          device=device, use_amp=False)
+                                          device=device)
         except Exception:
             val_error = 1.0
 
         child.f_exp = {"val_error": val_error}
 
-        # Save trained weights to disk for IPC back to main process
-        sd_path = os.path.join(
+        # ------------------------------------------------------------------
+        # 8. Persist trained weights to disk
+        # ------------------------------------------------------------------
+        trained_sd_path = os.path.join(
             tempfile.gettempdir(),
-            f"nas_cpu_{child.id}_{int(time.time() * 1000)}.pt",
+            f"nas_trained_{child.id}_{int(time.time() * 1000)}.pt",
         )
-        torch.save(child_model.state_dict(), sd_path)
+        torch.save(child_model.state_dict(), trained_sd_path)
 
         child.model = None
         del child_model
@@ -1943,7 +2447,7 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
             "idx":             idx,
             "status":          "ok",
             "pickled_child":   pickle.dumps(child),
-            "trained_sd_path": sd_path,
+            "trained_sd_path": trained_sd_path,
             "duration":        time.time() - start,
         }
 
@@ -1956,15 +2460,21 @@ def _worker_train_child(idx, pickled_payload, cfg, train_epochs, train_lr):
         }
 
 
-def _parallel_train_cpu(payloads, cfg, train_epochs, train_lr, desc):
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _parallel_train(payloads, cfg, train_epochs, train_lr, desc):
     """
-    Train children in parallel on CPU cores (used when no GPU is available).
+    Submit payloads to a process pool and collect trained Individuals.
+    Returns list of Individual objects with model weights loaded.
     """
     import torch
     cpu_count   = max(1, (os.cpu_count() or 2) - 1)
     max_workers = min(cpu_count, len(payloads))
 
     trained = []
+    input_shape = tuple(cfg.INPUT_SIZE)
 
     with ProcessPoolExecutor(max_workers=max_workers) as exe:
         futures = {
@@ -1973,14 +2483,16 @@ def _parallel_train_cpu(payloads, cfg, train_epochs, train_lr, desc):
             for idx, pc in payloads
         }
 
-        if cfg.SHOW_PROGRESS_BAR:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(as_completed(futures), total=len(futures),
-                                desc=desc, unit="model")
-            except ImportError:
-                iterator = as_completed(futures)
-        else:
+        try:
+            from tqdm.auto import tqdm
+            iterator = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=desc,
+                unit="model",
+                disable=not cfg.SHOW_PROGRESS_BAR
+            )
+        except ImportError:
             iterator = as_completed(futures)
 
         for fut in iterator:
@@ -1991,17 +2503,20 @@ def _parallel_train_cpu(payloads, cfg, train_epochs, train_lr, desc):
                 continue
 
             if result.get("status") != "ok":
-                error_logger.error("%s worker error [idx=%s]: %s\n%s",
-                                   desc, result.get("idx"),
-                                   result.get("error"),
-                                   result.get("traceback", ""))
+                error_logger.error(
+                    "%s worker error [idx=%s]: %s\n%s",
+                    desc, result.get("idx"),
+                    result.get("error"),
+                    result.get("traceback", ""),
+                )
                 continue
 
             try:
                 ind     = pickle.loads(result["pickled_child"])
                 sd_path = result.get("trained_sd_path")
                 if sd_path and os.path.exists(sd_path):
-                    model = ind.build_model()
+                    # Build model with CORRECT input shape in main process
+                    model = ind.build_model(input_shape=input_shape)
                     model.load_state_dict(
                         torch.load(sd_path, map_location="cpu",
                                    weights_only=True),
@@ -2013,72 +2528,9 @@ def _parallel_train_cpu(payloads, cfg, train_epochs, train_lr, desc):
                         pass
                 trained.append(ind)
             except Exception as e:
-                error_logger.error("Deserialise error: %s", e)
+                error_logger.error("Failed to deserialise trained child: %s", e)
 
     return trained
-
-
-# =============================================================================
-# Unified dispatcher — chooses GPU or CPU path automatically
-# =============================================================================
-
-def _train_all(payloads, cfg, train_epochs, train_lr, desc, device):
-    """
-    Route to GPU-sequential or CPU-parallel training based on device.
-    """
-    if device.startswith("cuda"):
-        return _sequential_train_gpu(
-            payloads, cfg, train_epochs, train_lr, device, desc
-        )
-    else:
-        return _parallel_train_cpu(
-            payloads, cfg, train_epochs, train_lr, desc
-        )
-
-
-# =============================================================================
-# Shared helpers
-# =============================================================================
-
-def _build_payloads(items, temp_dir, gen):
-    """
-    Serialise (child, parent, is_approx) triples into pickled payloads.
-    Returns (payloads, paths_to_clean_later).
-    """
-    import torch
-    payloads          = []
-    parent_temp_paths = []
-
-    for idx, (child, parent, approx) in enumerate(items):
-        try:
-            child_sd_path  = None
-            parent_sd_path = None
-
-            if child.model is not None:
-                child_sd_path = os.path.join(
-                    temp_dir, f"child_{child.id}_{gen}.pt"
-                )
-                torch.save(child.model.state_dict(), child_sd_path)
-
-            if parent is not None and parent.model is not None:
-                parent_sd_path = os.path.join(
-                    temp_dir, f"parent_{parent.id}_for_{child.id}_{gen}.pt"
-                )
-                torch.save(parent.model.state_dict(), parent_sd_path)
-                parent_temp_paths.append(parent_sd_path)
-
-            pc = pickle.dumps((
-                child.graph, child_sd_path,
-                parent.graph if parent is not None else None,
-                parent_sd_path,
-                approx,
-            ))
-            payloads.append((idx, pc))
-
-        except Exception as e:
-            error_logger.error("Serialise error for child %s: %s", child.id, e)
-
-    return payloads, parent_temp_paths
 
 
 def _save_generation_models(population, gen, models_dir):
@@ -2143,17 +2595,16 @@ def _print_summary(gen, population):
 
 def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     """
-    Run the LEMONADE NAS algorithm.
+    Run the LEMONADE algorithm.
 
     Parameters
     ----------
     init_graphs  : list[ArchitectureGraph]
-    cfg          : NASConfig
-    train_loader : DataLoader (main process — GPU path ignores this internally,
-                   creates its own with proper settings per generation)
-    val_loader   : DataLoader
-    device       : "cpu" | "cuda" | "cuda:N"
-    run_dir      : output directory
+    cfg          : NASConfig  (must have INPUT_SIZE and NUM_CLASSES)
+    train_loader : DataLoader (main process)
+    val_loader   : DataLoader (main process)
+    device       : "cpu" or "cuda"
+    run_dir      : str
 
     Returns
     -------
@@ -2161,31 +2612,32 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     """
     import torch
 
-    use_gpu = device.startswith("cuda") and torch.cuda.is_available()
+    input_shape = tuple(cfg.INPUT_SIZE)   # e.g. (1,3,64,64) for Tiny ImageNet
+
     logger.info(
         "LEMONADE start: gens=%d N_pc=%d N_ac=%d "
-        "init_ep=%d child_ep=%d distill_ep=%d "
-        "device=%s amp=%s",
+        "init_ep=%d child_ep=%d distill_ep=%d device=%s input=%s",
         cfg.GENERATIONS, cfg.N_CHILDREN, cfg.N_ACCEPT,
         cfg.INIT_EPOCHS, cfg.CHILD_EPOCHS, cfg.DISTILL_EPOCHS,
-        device, cfg.USE_AMP and use_gpu,
+        device, input_shape,
     )
 
     models_dir = os.path.join(run_dir, "models")
     os.makedirs(models_dir, exist_ok=True)
-    temp_dir = tempfile.gettempdir()
-    history  = {}
-    sampler  = KDESampler(base_bandwidth=cfg.KDE_BANDWIDTH)
+    temp_dir   = tempfile.gettempdir()
+    history    = {}
+    sampler    = KDESampler(base_bandwidth=cfg.KDE_BANDWIDTH)
 
     # ------------------------------------------------------------------
-    # Initialise population with cheap objectives
+    # Initialise population — use correct input shape for cheap eval
     # ------------------------------------------------------------------
     population = [Individual(g) for g in init_graphs]
+
     for ind in population:
         try:
             ind.evaluate_cheap(
                 objective_keys=cfg.CHEAP_OBJECTIVES,
-                input_size=(1, 3, 32, 32),
+                input_size=input_shape,          # ← correct shape
             )
         except Exception as e:
             ind.f_cheap = {k: 0 for k in cfg.CHEAP_OBJECTIVES}
@@ -2195,28 +2647,27 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
     # Generation 0 — train seed population
     # ------------------------------------------------------------------
     logger.info("=== Generation 0: Training %d seed models ===", len(population))
-
-    # Build payloads: each seed trains from scratch (no parent)
-    seed_triples = [(ind, None, False) for ind in population]
-    payloads_g0, paths_g0 = _build_payloads(seed_triples, temp_dir, gen=0)
+    payloads_g0 = []
+    for idx, ind in enumerate(population):
+        try:
+            if ind.model is None:
+                ind.build_model(input_shape=input_shape)   # ← correct shape
+            sd_path = os.path.join(temp_dir, f"seed_{ind.id}.pt")
+            torch.save(ind.model.state_dict(), sd_path)
+            pc = pickle.dumps((ind.graph, sd_path, None, None, False))
+            payloads_g0.append((idx, pc))
+        except Exception as e:
+            error_logger.error("Gen 0 serialise error for %s: %s", ind.id, e)
 
     if payloads_g0:
-        trained_seeds = _train_all(
+        trained_seeds = _parallel_train(
             payloads_g0, cfg,
             train_epochs=cfg.INIT_EPOCHS,
             train_lr=cfg.INIT_LR,
             desc="Gen 0 | Seed Training",
-            device=device,
         )
         if trained_seeds:
             population = trained_seeds
-
-    # Clean up seed temp files
-    for path in paths_g0:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
 
     population = pareto_front(population)
     population = fill_with_diversity(population, population, cfg.MIN_POP)
@@ -2239,28 +2690,22 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
         parent_temp_paths = []
 
         try:
-            # --------------------------------------------------------------
-            # STEP 1: KDE fit on current population (cheap objectives only)
-            # --------------------------------------------------------------
+            # ── STEP 1: KDE fit on cheap objectives ──────────────────────
             sampler.fit(population,
                         objective_keys=cfg.CHEAP_OBJECTIVES,
                         generation=gen)
 
-            # --------------------------------------------------------------
-            # STEP 2: Sample npc parents (inverse KDE density)
-            # --------------------------------------------------------------
+            # ── STEP 2: Sample npc parents ───────────────────────────────
             parents = sampler.sample(
                 population, cfg.N_CHILDREN, allow_repeats=True
             )
             if not parents:
-                logger.warning("Gen %d: no parents sampled — skipping", gen)
+                logger.warning("Gen %d: no parents — skipping", gen)
                 history[gen] = history[gen - 1]
                 continue
 
-            # --------------------------------------------------------------
-            # STEP 3: Generate npc candidate children (NO training yet)
-            # --------------------------------------------------------------
-            candidates = []   # (child_Individual, parent_Individual, is_approx)
+            # ── STEP 3: Generate npc candidate children (no training) ────
+            candidates = []   # (child, parent, is_approx)
 
             for p in parents:
                 try:
@@ -2268,15 +2713,15 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                     if new_graph is None:
                         continue
 
-                    approx      = is_approx_op(op_name)
-                    child       = Individual(new_graph)
+                    approx = is_approx_op(op_name)
+                    child  = Individual(new_graph)
                     child.op_name = op_name
 
-                    # Lamarckian weight transfer (CPU, no GPU needed)
+                    # Lamarckian weight transfer — build with correct input shape
                     try:
                         from morphisms.weights import transfer_weights
-                        parent_model = p.build_model()
-                        child_model  = child.build_model()
+                        parent_model = p.build_model(input_shape=input_shape)
+                        child_model  = child.build_model(input_shape=input_shape)
                         transfer_weights(parent_model, child_model,
                                          child.graph, op_name, target_info)
                     except Exception as e:
@@ -2284,7 +2729,6 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                             "Weight transfer %s→%s (%s): %s",
                             p.id, child.id, op_name, e,
                         )
-                        # child has random init — still valid
 
                     candidates.append((child, p, approx))
 
@@ -2294,29 +2738,25 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                     )
 
             if not candidates:
-                logger.warning("Gen %d: no candidates generated", gen)
+                logger.warning("Gen %d: no candidates", gen)
                 history[gen] = history[gen - 1]
                 continue
 
-            # --------------------------------------------------------------
-            # STEP 4: Evaluate CHEAP objectives (free — no training)
-            # --------------------------------------------------------------
+            # ── STEP 4: Cheap eval on all candidates ─────────────────────
             valid_candidates = []
             for child, parent, approx in candidates:
                 try:
                     cheap = child.evaluate_cheap(
                         objective_keys=cfg.CHEAP_OBJECTIVES,
-                        input_size=(1, 3, 32, 32),
+                        input_size=input_shape,        # ← correct shape
                     )
                     if cheap.get("params", 0) <= cfg.MAX_PARAMS:
                         valid_candidates.append((child, parent, approx))
                     else:
-                        logger.debug(
-                            "Candidate %s exceeds MAX_PARAMS", child.id
-                        )
+                        logger.debug("Candidate %s exceeds MAX_PARAMS", child.id)
                 except Exception as e:
                     error_logger.error(
-                        "Cheap eval failed for %s: %s", child.id, e
+                        "Cheap eval failed for candidate %s: %s", child.id, e
                     )
 
             if not valid_candidates:
@@ -2324,9 +2764,7 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                 history[gen] = history[gen - 1]
                 continue
 
-            # --------------------------------------------------------------
-            # STEP 5: KDE filter — sample nac accepted children
-            # --------------------------------------------------------------
+            # ── STEP 5: KDE filter → nac accepted children ───────────────
             candidate_inds = [c for c, _, _ in valid_candidates]
             sampler.fit(candidate_inds,
                         objective_keys=cfg.CHEAP_OBJECTIVES,
@@ -2338,41 +2776,59 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
             accepted_set = {id(ind) for ind in accepted_inds}
 
             accepted_triples = [
-                (c, p, a)
-                for c, p, a in valid_candidates
+                (c, p, a) for c, p, a in valid_candidates
                 if id(c) in accepted_set
             ]
+            logger.info("Gen %d: %d → %d accepted for training",
+                        gen, len(valid_candidates), len(accepted_triples))
 
-            logger.info(
-                "Gen %d: %d candidates → %d accepted for training",
-                gen, len(valid_candidates), len(accepted_triples),
-            )
+            # ── STEP 6: Train ONLY accepted children ──────────────────────
+            pickled_children = []
+            for idx, (child, parent, approx) in enumerate(accepted_triples):
+                try:
+                    child_sd_path  = None
+                    parent_sd_path = None
 
-            # --------------------------------------------------------------
-            # STEP 6: Train only accepted children (expensive)
-            # --------------------------------------------------------------
-            payloads, parent_temp_paths = _build_payloads(
-                accepted_triples, temp_dir, gen
-            )
+                    if child.model is not None:
+                        child_sd_path = os.path.join(
+                            temp_dir, f"child_{child.id}_{gen}.pt"
+                        )
+                        torch.save(child.model.state_dict(), child_sd_path)
+
+                    if parent.model is not None:
+                        parent_sd_path = os.path.join(
+                            temp_dir,
+                            f"parent_{parent.id}_for_{child.id}_{gen}.pt",
+                        )
+                        torch.save(parent.model.state_dict(), parent_sd_path)
+                        parent_temp_paths.append(parent_sd_path)
+
+                    pc = pickle.dumps((
+                        child.graph, child_sd_path,
+                        parent.graph, parent_sd_path,
+                        approx,
+                    ))
+                    pickled_children.append((idx, pc))
+
+                except Exception as e:
+                    error_logger.error(
+                        "Gen %d: serialise error for %s: %s", gen, child.id, e
+                    )
 
             trained_children = []
-            if payloads:
-                trained_children = _train_all(
-                    payloads, cfg,
+            if pickled_children:
+                trained_children = _parallel_train(
+                    pickled_children, cfg,
                     train_epochs=child_epochs,
                     train_lr=cfg.CHILD_LR,
-                    desc=f"Gen {gen} | Training {len(payloads)} children",
-                    device=device,
+                    desc=f"Gen {gen} | Training {len(pickled_children)} children",
                 )
 
-            # --------------------------------------------------------------
-            # STEP 7: Pareto update + diversity fill
-            # --------------------------------------------------------------
+            # ── STEP 7: Pareto update ─────────────────────────────────────
             if trained_children:
                 combined   = population + trained_children
                 new_front  = pareto_front(combined)
-                population = fill_with_diversity(new_front, combined,
-                                                 cfg.MIN_POP)
+                population = fill_with_diversity(new_front, combined, cfg.MIN_POP)
             else:
                 logger.warning("Gen %d: no children trained successfully", gen)
 
@@ -2387,13 +2843,9 @@ def run_lemonade(init_graphs, cfg, train_loader, val_loader, device, run_dir):
                     os.remove(path)
                 except OSError:
                     pass
-            elapsed = time.time() - gen_start
             logger.info("Generation %d complete in %.1fs | pop=%d",
-                        gen, elapsed, len(population))
+                        gen, time.time() - gen_start, len(population))
 
-        # ------------------------------------------------------------------
-        # Save history + model weights for this generation
-        # ------------------------------------------------------------------
         history[gen] = _save_generation_models(population, gen, models_dir)
         _print_summary(gen, population)
 
@@ -4293,145 +4745,168 @@ FILE:   basenet.py
 PATH:   .\models\basenet.py
 ################################################################################
 
-################################################################################
-# FOLDER: models
-# FILE:   basenet.py
-# PATH:   .\models\basenet.py
-################################################################################
+# models/basenet.py
+# =============================================================================
+# Builds the seed (base) architecture graph for each supported dataset.
+#
+# Architecture layout per dataset:
+#
+#  CIFAR-10 / CIFAR-100  (input 32x32)
+#  ─────────────────────
+#  Stem : Conv(3→16, 3x3, s=1) → BN → ReLU          [32x32]
+#  Body : 3 stages, 2 reduction cells
+#         Stage 0: Cell(16,16)  → Reduce(16→32,s=2)  [32→16]
+#         Stage 1: Cell(32,32)  → Reduce(32→64,s=2)  [16→8]
+#         Stage 2: Cell(64,64)                         [8x8]
+#  Head : MaxPool(8×8) → Flatten → Linear(64, C)
+#
+#  TINY_IMAGENET  (input 64x64, 200 classes)
+#  ─────────────
+#  Stem : Conv(3→16, 3x3, s=2) → BN → ReLU          [32x32]
+#  Body : same 3-stage layout as CIFAR                [32→16→8]
+#  Head : MaxPool(8×8) → Flatten → Linear(64, 200)
+#
+#  IMAGENET / PLACES365 / COCO  (input 224x224)
+#  ──────────────────────────────
+#  Stem : Conv(3→32, 7x7, s=2) → BN → ReLU → MaxPool(3,s=2)  [56x56]
+#  Body : 3 stages, 2 reduction cells
+#         Stage 0: Cell(32,32)   → Reduce(32→64,s=2)  [56→28]
+#         Stage 1: Cell(64,64)   → Reduce(64→128,s=2) [28→14]
+#         Stage 2: Cell(128,128)                        [14x14]
+#  Head : MaxPool(14×14) → Flatten → Linear(128, C)
+#
+# The init_channels and final_spatial_size values are chosen so that
+# MaxPool perfectly collapses the feature map to 1x1.
+# =============================================================================
 
 from architectures.node import Node
 from architectures.graph import ArchitectureGraph
 from models.cells import add_cell, add_reduction_cell
 
+
+# ---------------------------------------------------------------------------
+# Groups of datasets that share the same architecture layout
+# ---------------------------------------------------------------------------
+_CIFAR_DATASETS        = {"CIFAR-10", "CIFAR-100"}
+_TINY_IMAGENET_DATASETS = {"TINY_IMAGENET"}
+_LARGE_DATASETS        = {"IMAGENET", "PLACES365", "COCO"}
+
+
 class GraphBuilder:
+    """
+    Helper that assigns sequential node IDs and keeps a pointer to the last
+    added node, making it easy to build linear or branching architectures.
+    """
     def __init__(self):
-        self.g = ArchitectureGraph()
+        self.g          = ArchitectureGraph()
         self.node_count = 0
-        
+
     def add_node(self, op_type, params, parents):
         node = Node(self.node_count, op_type, params, parents)
         self.g.add_node(node)
         self.node_count += 1
         return node.id
 
-def build_basenet_graph(num_classes=10, dataset_type="CIFAR-10"):
+
+def build_basenet_graph(num_classes: int, dataset_type: str) -> ArchitectureGraph:
     """
-    Constructs the exact BaseNet architecture dynamically based on the dataset geometry!
+    Construct the seed architecture graph for *dataset_type*.
+
+    Parameters
+    ----------
+    num_classes  : number of output classes (from cfg.NUM_CLASSES)
+    dataset_type : one of the supported dataset name strings
+
+    Returns
+    -------
+    ArchitectureGraph ready to be compiled into a CompiledModel
     """
     builder = GraphBuilder()
-    init_channels = 16
-    
-    # ------------------------------------------------------------------
-    # 1. The Stem (Image Size Handling)
-    # ------------------------------------------------------------------
-    if dataset_type == "IMAGENET":
-        # Aggressive downsampling for 224x224 images (Shrinks to 56x56 immediately)
-        curr = builder.add_node('conv', {'in_channels': 3, 'out_channels': init_channels, 'kernel_size': 7, 'stride': 2, 'padding': 3}, [])
-        curr = builder.add_node('bn', {'num_features': init_channels}, [curr])
+
+    # -----------------------------------------------------------------------
+    # 1. Stem — dataset-specific downsampling to a common feature-map size
+    # -----------------------------------------------------------------------
+    if dataset_type in _CIFAR_DATASETS:
+        # Input: 32x32  →  stem output: 32x32  (no downsampling)
+        init_channels = 16
+        curr = builder.add_node('conv', {
+            'in_channels': 3, 'out_channels': init_channels,
+            'kernel_size': 3, 'stride': 1, 'padding': 1,
+        }, [])
+        curr = builder.add_node('bn',   {'num_features': init_channels}, [curr])
+        curr = builder.add_node('relu', {}, [curr])
+
+    elif dataset_type in _TINY_IMAGENET_DATASETS:
+        # Input: 64x64  →  stem output: 32x32  (single stride-2 conv)
+        init_channels = 16
+        curr = builder.add_node('conv', {
+            'in_channels': 3, 'out_channels': init_channels,
+            'kernel_size': 3, 'stride': 2, 'padding': 1,
+        }, [])
+        curr = builder.add_node('bn',   {'num_features': init_channels}, [curr])
+        curr = builder.add_node('relu', {}, [curr])
+
+    elif dataset_type in _LARGE_DATASETS:
+        # Input: 224x224  →  stem output: 56x56  (7x7 s=2 + maxpool s=2)
+        # Use 32 init channels (vs 16 for small datasets) for richer features
+        # on high-resolution inputs.
+        init_channels = 32
+        curr = builder.add_node('conv', {
+            'in_channels': 3, 'out_channels': init_channels,
+            'kernel_size': 7, 'stride': 2, 'padding': 3,
+        }, [])
+        curr = builder.add_node('bn',   {'num_features': init_channels}, [curr])
         curr = builder.add_node('relu', {}, [curr])
         curr = builder.add_node('maxpool', {'kernel_size': 3, 'stride': 2}, [curr])
+
     else:
-        # Standard CIFAR stem for 32x32 images
-        curr = builder.add_node('conv', {'in_channels': 3, 'out_channels': init_channels, 'kernel_size': 3, 'stride': 1, 'padding': 1}, [])
-        curr = builder.add_node('bn', {'num_features': init_channels}, [curr])
-        curr = builder.add_node('relu', {}, [curr])
-        
+        raise ValueError(
+            f"Unknown dataset_type '{dataset_type}'. "
+            f"Supported: CIFAR-10, CIFAR-100, TINY_IMAGENET, IMAGENET, PLACES365, COCO"
+        )
+
+    # -----------------------------------------------------------------------
+    # 2. Body — 3 stages of cells + 2 reduction cells (shared structure)
+    #
+    #  All datasets use the SAME body structure after the stem, because the
+    #  stem normalises spatial dimensions to a common starting point:
+    #    CIFAR / Tiny-IN  →  32x32  →  body outputs  8x8   (C=64)
+    #    Large datasets   →  56x56  →  body outputs 14x14  (C=128)
+    # -----------------------------------------------------------------------
     C_curr = init_channels
-    num_cells_per_stage = 1
-    
-    # ------------------------------------------------------------------
-    # 2. The Body (Stacked Cells)
-    # ------------------------------------------------------------------
+    num_cells_per_stage = 1   # kept small for fast NAS search; operators grow it
+
     for stage in range(3):
         for _ in range(num_cells_per_stage):
             curr = add_cell(builder, C_curr, C_curr, stride=1, parent_id=curr)
-            
-        if stage < 2:
+
+        if stage < 2:        # reduction after stages 0 and 1 only
             C_next = C_curr * 2
-            curr = add_reduction_cell(builder, C_curr, C_next, parent_id=curr)
+            curr   = add_reduction_cell(builder, C_curr, C_next, parent_id=curr)
             C_curr = C_next
-            
-    # ------------------------------------------------------------------
-    # 3. The Head (Classification)
-    # ------------------------------------------------------------------
-    # Calculate the remaining spatial dimension mathematically
-    final_spatial_size = 14 if dataset_type == "IMAGENET" else 8
-    
-    # Reduces the final spatial dimensions down to 1x1 perfectly.
-    curr = builder.add_node('maxpool', {'kernel_size': final_spatial_size, 'stride': final_spatial_size}, [curr])
-    curr = builder.add_node('flatten', {}, [curr])
-    out_node = builder.add_node('linear', {'in_features': C_curr, 'out_features': num_classes}, [curr])
-    
+
+    # -----------------------------------------------------------------------
+    # 3. Head — global pooling + classifier
+    #
+    #  After the body:
+    #    CIFAR / Tiny-IN   →  8x8    →  maxpool(8×8)   → 1x1
+    #    Large datasets    →  14x14  →  maxpool(14×14) → 1x1
+    # -----------------------------------------------------------------------
+    if dataset_type in _CIFAR_DATASETS or dataset_type in _TINY_IMAGENET_DATASETS:
+        final_spatial = 8
+    else:
+        final_spatial = 14
+
+    curr     = builder.add_node('maxpool', {
+        'kernel_size': final_spatial, 'stride': final_spatial,
+    }, [curr])
+    curr     = builder.add_node('flatten', {}, [curr])
+    out_node = builder.add_node('linear',  {
+        'in_features': C_curr, 'out_features': num_classes,
+    }, [curr])
+
     builder.g.set_output(out_node)
     return builder.g
-
-# ################################################################################
-# # FOLDER: models
-# # FILE:   basenet.py
-# # PATH:   .\models\basenet.py
-# ################################################################################
-
-# from architectures.node import Node
-# from architectures.graph import ArchitectureGraph
-# from models.cells import add_cell, add_reduction_cell
-
-# class GraphBuilder:
-#     """
-#     Helper utility to sequentially construct ArchitectureGraph nodes 
-#     without needing to manually track IDs.
-#     """
-#     def __init__(self):
-#         self.g = ArchitectureGraph()
-#         self.node_count = 0
-        
-#     def add_node(self, op_type, params, parents):
-#         node = Node(self.node_count, op_type, params, parents)
-#         self.g.add_node(node)
-#         self.node_count += 1
-#         return node.id
-
-# def build_basenet_graph():
-#     """
-#     Constructs the exact BaseNet architecture (Stem -> Cells -> ReductionCells)
-#     as a dynamic, mutable ArchitectureGraph!
-#     """
-#     builder = GraphBuilder()
-    
-#     # ------------------------------------------------------------------
-#     # 1. The Stem (Initial convolutions)
-#     # ------------------------------------------------------------------
-#     init_channels = 16
-#     curr = builder.add_node('conv', {'in_channels': 3, 'out_channels': init_channels, 'kernel_size': 3, 'stride': 1, 'padding': 1}, [])
-#     curr = builder.add_node('bn', {'num_features': init_channels}, [curr])
-#     curr = builder.add_node('relu', {}, [curr])
-    
-#     C_curr = init_channels
-#     num_cells_per_stage = 1
-    
-#     # ------------------------------------------------------------------
-#     # 2. The Body (Stacked Cells)
-#     # ------------------------------------------------------------------
-#     for stage in range(3):
-#         # Apply Normal Cells for feature extraction
-#         for _ in range(num_cells_per_stage):
-#             curr = add_cell(builder, C_curr, C_curr, stride=1, parent_id=curr)
-            
-#         # Apply Reduction Cells to downsample (except on the last stage)
-#         if stage < 2:
-#             C_next = C_curr * 2
-#             curr = add_reduction_cell(builder, C_curr, C_next, parent_id=curr)
-#             C_curr = C_next
-            
-#     # ------------------------------------------------------------------
-#     # 3. The Head (Classification)
-#     # ------------------------------------------------------------------
-#     # Reduces the final 8x8 spatial dimensions down to 1x1 perfectly.
-#     curr = builder.add_node('maxpool', {'kernel_size': 8, 'stride': 8}, [curr])
-#     curr = builder.add_node('flatten', {}, [curr])
-#     out_node = builder.add_node('linear', {'in_features': C_curr, 'out_features': 10}, [curr])
-    
-#     builder.g.set_output(out_node)
-#     return builder.g
 
 ================================================================================
 END OF: models/basenet.py
@@ -4444,62 +4919,76 @@ FILE:   blocks.py
 PATH:   .\models\blocks.py
 ################################################################################
 
-################################################################################
-# FOLDER: models
-# FILE:   blocks.py
-# PATH:   .\models\blocks.py
-################################################################################
+# models/blocks.py
+# =============================================================================
+# Low-level graph-node building blocks.
+# These work correctly for ANY spatial dimension — the CompiledModel's
+# shape-inference engine resolves actual channel/spatial sizes at build time.
+# All convolutions use 3x3 with padding=1 so they preserve spatial dimensions
+# (stride controls downsampling, not kernel size).
+# =============================================================================
+
 
 def add_conv_block(builder, C_in, C_out, kernel_size, stride, padding, parent_id):
     """
-    Constructs a standard Conv -> BatchNorm -> ReLU sequence as graph nodes.
+    Conv → BatchNorm → ReLU sequence as graph nodes.
+    Works for any input spatial size ≥ kernel_size.
     """
     parents = [parent_id] if parent_id is not None else []
-    
+
     conv = builder.add_node('conv', {
-        'in_channels': C_in, 
-        'out_channels': C_out, 
-        'kernel_size': kernel_size, 
-        'stride': stride, 
-        'padding': padding
+        'in_channels':  C_in,
+        'out_channels': C_out,
+        'kernel_size':  kernel_size,
+        'stride':       stride,
+        'padding':      padding,
     }, parents)
-    
-    bn = builder.add_node('bn', {'num_features': C_out}, [conv])
+
+    bn   = builder.add_node('bn',   {'num_features': C_out}, [conv])
     relu = builder.add_node('relu', {}, [bn])
-    
+
     return relu
 
 
 def add_res_block(builder, C_in, C_out, stride, parent_id):
     """
-    Constructs a Residual Block with skip connections as graph nodes.
+    Residual block: two 3x3 convs with a learnable shortcut projection
+    when channels or spatial dimensions change.
+
+    Structure:
+        input
+          ├─ Conv(3x3) → BN → ReLU → Conv(3x3) → BN ──┐
+          └─ [projection 1x1 if C_in≠C_out or stride≠1] │
+                                                    Add → ReLU → output
     """
-    # 1. First Conv layer of the residual block
+    # --- Main path ---
     conv1 = builder.add_node('conv', {
-        'in_channels': C_in, 'out_channels': C_out, 'kernel_size': 3, 'stride': stride, 'padding': 1
+        'in_channels': C_in, 'out_channels': C_out,
+        'kernel_size': 3,    'stride': stride, 'padding': 1,
     }, [parent_id])
-    bn1 = builder.add_node('bn', {'num_features': C_out}, [conv1])
-    relu1 = builder.add_node('relu', {}, [bn1])
-    
-    # 2. Second Conv layer
+    bn1   = builder.add_node('bn',   {'num_features': C_out}, [conv1])
+    relu1 = builder.add_node('relu', {},                      [bn1])
+
     conv2 = builder.add_node('conv', {
-        'in_channels': C_out, 'out_channels': C_out, 'kernel_size': 3, 'stride': 1, 'padding': 1
+        'in_channels': C_out, 'out_channels': C_out,
+        'kernel_size': 3,     'stride': 1, 'padding': 1,
     }, [relu1])
     bn2 = builder.add_node('bn', {'num_features': C_out}, [conv2])
-    
-    # 3. Shortcut Projection (if dimensions change)
+
+    # --- Shortcut (projection if dimensions change) ---
     shortcut_id = parent_id
     if stride != 1 or C_in != C_out:
-        s_conv = builder.add_node('conv', {
-            'in_channels': C_in, 'out_channels': C_out, 'kernel_size': 1, 'stride': stride, 'padding': 0
+        s_conv      = builder.add_node('conv', {
+            'in_channels': C_in, 'out_channels': C_out,
+            'kernel_size': 1,    'stride': stride, 'padding': 0,
         }, [parent_id])
-        s_bn = builder.add_node('bn', {'num_features': C_out}, [s_conv])
+        s_bn        = builder.add_node('bn', {'num_features': C_out}, [s_conv])
         shortcut_id = s_bn
-        
-    # 4. Merge shortcut and path
-    add_node = builder.add_node('add', {}, [bn2, shortcut_id])
+
+    # --- Merge ---
+    add_node = builder.add_node('add',  {},  [bn2, shortcut_id])
     relu_out = builder.add_node('relu', {}, [add_node])
-    
+
     return relu_out
 
 ================================================================================
@@ -4513,31 +5002,55 @@ FILE:   cells.py
 PATH:   .\models\cells.py
 ################################################################################
 
-################################################################################
-# FOLDER: models
-# FILE:   cells.py
-# PATH:   .\models\cells.py
-################################################################################
+# models/cells.py
+# =============================================================================
+# Cell-level building blocks composed from blocks.py primitives.
+#
+# A "cell" is the repeatable unit of the architecture body.
+# A "reduction cell" halves spatial dimensions while doubling channels.
+#
+# Both cells work correctly for any input spatial size because the underlying
+# Conv/BN layers handle the actual tensor shapes at CompiledModel build time.
+# =============================================================================
 
 from models.blocks import add_conv_block, add_res_block
 
+
 def add_cell(builder, C_in, C_out, stride, parent_id):
     """
-    Constructs a Normal Cell. Adapts dimensions first if necessary.
+    Normal Cell: optional channel/spatial adaptation → residual block.
+
+    If C_in == C_out and stride == 1 (no dimension change) the adaptation
+    1x1 conv is skipped, saving parameters.
+
+    Used for feature extraction at a fixed spatial resolution.
+    Compatible with: 32x32 (CIFAR), 64x64 (Tiny-ImageNet stem output),
+                     56x56 / 28x28 / 14x14 (ImageNet-style bodies).
     """
     if C_in != C_out or stride != 1:
-        # 1x1 Convolution to adjust channels/spatial dimensions
-        parent_id = add_conv_block(builder, C_in, C_out, kernel_size=1, stride=stride, padding=0, parent_id=parent_id)
-        
-    # Standard residual feature extraction
+        # 1x1 conv to adapt channel count / spatial size before the res block
+        parent_id = add_conv_block(
+            builder, C_in, C_out,
+            kernel_size=1, stride=stride, padding=0,
+            parent_id=parent_id,
+        )
+
     return add_res_block(builder, C_out, C_out, stride=1, parent_id=parent_id)
 
 
 def add_reduction_cell(builder, C_in, C_out, parent_id):
     """
-    Constructs a Reduction Cell to halve spatial dimensions and double channels.
+    Reduction Cell: stride-2 Conv-BN-ReLU that halves spatial resolution
+    and optionally changes channel count.
+
+    A plain stride-2 conv is used rather than a pooling op so the NAS
+    morphism operators (prune, widen, sepconv) can mutate it freely.
     """
-    return add_conv_block(builder, C_in, C_out, kernel_size=3, stride=2, padding=1, parent_id=parent_id)
+    return add_conv_block(
+        builder, C_in, C_out,
+        kernel_size=3, stride=2, padding=1,
+        parent_id=parent_id,
+    )
 
 ================================================================================
 END OF: models/cells.py
@@ -5274,16 +5787,16 @@ FILE:   distill.py
 PATH:   .\train\distill.py
 ################################################################################
 
-# train/distill.py
-import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import gc
+from tqdm.auto import tqdm   # was: from tqdm import tqdm
+# from tqdm import tqdm
 from utils.logger import get_logger
 
 logger = get_logger("distill", logfile="logs/distill.log")
-
 
 def train_with_distillation(
     student_model: nn.Module,
@@ -5292,123 +5805,555 @@ def train_with_distillation(
     device="cpu",
     epochs=1,
     temperature=3.0,
-    alpha=0.0,       # 0.0 = pure KD alignment, 1.0 = pure CE hard labels
-    lr=0.001,
+    alpha=0.0,
+    lr=0.01,
     weight_decay=1e-4,
     optimizer_name="sgd",
-    show_progress=True,
-    use_amp=False,
+    show_progress=True
 ):
-    """
-    Knowledge-distillation alignment phase for ANM children.
-
-    Called BEFORE standard training to recover accuracy lost by approximate
-    morphisms (prune, sepconv, remove).
-
-    Parameters
-    ----------
-    use_amp : bool
-        Automatic Mixed Precision — gives 1.5-2x GPU speedup.
-        Automatically disabled if device is not CUDA.
-    """
-    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
-    use_amp = use_amp and is_cuda
-
     student_model.to(device)
     teacher_model.to(device)
+    
     student_model.train()
     teacher_model.eval()
 
-    # Freeze teacher completely
+    # Strictly freeze teacher parameters to prevent massive memory leaks
     for param in teacher_model.parameters():
         param.requires_grad = False
 
     criterion_hard = nn.CrossEntropyLoss()
-    criterion_soft = nn.KLDivLoss(reduction="batchmean")
-
-    name = optimizer_name.lower()
-    params = [p for p in student_model.parameters() if p.requires_grad]
-    if name == "adam":
-        optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
-    elif name == "adamw":
-        optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    else:
-        optimizer = optim.SGD(params, lr=lr, momentum=0.9,
-                              weight_decay=weight_decay)
-
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(epochs, 1)
+    criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+    optimizer = optim.SGD(
+        student_model.parameters(), 
+        lr=lr, 
+        momentum=0.9, 
+        weight_decay=weight_decay 
     )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-
-    logger.info(
-        "Distillation: epochs=%d T=%.1f alpha=%.2f lr=%.4f device=%s amp=%s",
-        epochs, temperature, alpha, lr, device, use_amp,
-    )
+    logger.info("Starting Pure Distillation Alignment: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
+                epochs, temperature, alpha, lr, device)
 
     for epoch in range(epochs):
-        if show_progress:
-            try:
-                from tqdm import tqdm
-                batch_iter = tqdm(train_loader,
-                                  desc=f"Distill [{epoch+1}/{epochs}]",
-                                  leave=False, unit="batch")
-            except ImportError:
-                batch_iter = train_loader
-        else:
-            batch_iter = train_loader
-
+        running_loss = 0.0
+        
+        # Respect the show_progress flag to avoid terminal spam from workers
+        batch_iter = tqdm(train_loader, desc=f"Aligning Weights [{epoch + 1}/{epochs}]", leave=False, unit="batch", disable=not show_progress)
+        
         for batch_idx, (inputs, targets) in enumerate(batch_iter):
-            inputs  = inputs.to(device,  non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            inputs, targets = inputs.to(device), targets.to(device)
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            student_logits = student_model(inputs)
+            
+            with torch.no_grad():
+                teacher_logits = teacher_model(inputs)
 
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    student_logits = student_model(inputs)
-                    with torch.no_grad():
-                        teacher_logits = teacher_model(inputs)
+            loss_hard = criterion_hard(student_logits, targets)
 
-                    loss_hard = criterion_hard(student_logits, targets)
-                    s_log_p   = F.log_softmax(student_logits / temperature, dim=1)
-                    t_p       = F.softmax(teacher_logits    / temperature, dim=1)
-                    loss_soft = criterion_soft(s_log_p, t_p) * (temperature ** 2)
-                    loss      = alpha * loss_hard + (1.0 - alpha) * loss_soft
+            student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+            teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+            loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(),
-                                               max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                student_logits = student_model(inputs)
-                with torch.no_grad():
-                    teacher_logits = teacher_model(inputs)
-
-                loss_hard = criterion_hard(student_logits, targets)
-                s_log_p   = F.log_softmax(student_logits / temperature, dim=1)
-                t_p       = F.softmax(teacher_logits    / temperature, dim=1)
-                loss_soft = criterion_soft(s_log_p, t_p) * (temperature ** 2)
-                loss      = alpha * loss_hard + (1.0 - alpha) * loss_soft
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(),
-                                               max_norm=5.0)
-                optimizer.step()
-
-            if show_progress and hasattr(batch_iter, "set_postfix"):
+            # With alpha=0.0, this is pure mimicking of the teacher
+            loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+            optimizer.step()
+            running_loss += loss.item()
+            
+            if show_progress:
                 batch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Periodic cleanup to avoid accumulating graph memory
-            if batch_idx % 20 == 0:
+            # Force memory cleanup to stop Windows SegFaults
+            del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
+            if batch_idx % 10 == 0:
                 gc.collect()
 
         scheduler.step()
 
-    logger.info("Distillation complete.")
+# ################################################################################
+# # FOLDER: train
+# # FILE:   distill.py
+# # PATH:   .\train\distill.py
+# ################################################################################
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import torch.optim as optim
+# import gc
+# from tqdm import tqdm
+# from utils.logger import get_logger
+
+# logger = get_logger("distill", logfile="logs/distill.log")
+
+# def train_with_distillation(
+#     student_model: nn.Module,
+#     teacher_model: nn.Module,
+#     train_loader,
+#     device="cpu",
+#     epochs=1,
+#     temperature=3.0,
+#     alpha=0.0,  # PURE DISTILLATION: 0.0 means ignore hard labels, strictly align to teacher.
+#     lr=0.01
+# ):
+#     student_model.to(device)
+#     teacher_model.to(device)
+    
+#     student_model.train()
+#     teacher_model.eval()
+
+#     # Strictly freeze teacher parameters to prevent massive memory leaks
+#     for param in teacher_model.parameters():
+#         param.requires_grad = False
+
+#     criterion_hard = nn.CrossEntropyLoss()
+#     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+#     optimizer = optim.SGD(
+#         student_model.parameters(), 
+#         lr=lr, 
+#         momentum=0.9, 
+#         weight_decay=1e-4 
+#     )
+#     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+#     logger.info("Starting Pure Distillation Alignment: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
+#                 epochs, temperature, alpha, lr, device)
+
+#     for epoch in range(epochs):
+#         running_loss = 0.0
+        
+#         batch_iter = tqdm(train_loader, desc=f"Aligning Weights [{epoch + 1}/{epochs}]", leave=False, unit="batch")
+        
+#         for batch_idx, (inputs, targets) in enumerate(batch_iter):
+#             inputs, targets = inputs.to(device), targets.to(device)
+
+#             optimizer.zero_grad()
+#             student_logits = student_model(inputs)
+            
+#             with torch.no_grad():
+#                 teacher_logits = teacher_model(inputs)
+
+#             loss_hard = criterion_hard(student_logits, targets)
+
+#             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+#             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+#             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+
+#             # With alpha=0.0, this is pure mimicking of the teacher
+#             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+#             optimizer.step()
+#             running_loss += loss.item()
+            
+#             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
+
+#             # Force memory cleanup to stop Windows SegFaults
+#             del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
+#             if batch_idx % 10 == 0:
+#                 gc.collect()
+
+#         scheduler.step()
+
+# # # train/distill.py
+# # import torch
+# # import torch.nn as nn
+# # import torch.nn.functional as F
+# # import torch.optim as optim
+# # import gc
+# # from tqdm import tqdm
+# # from utils.logger import get_logger
+
+# # logger = get_logger("distill", logfile="logs/distill.log")
+
+# # def train_with_distillation(
+# #     student_model: nn.Module,
+# #     teacher_model: nn.Module,
+# #     train_loader,
+# #     device="cpu",
+# #     epochs=1,
+# #     temperature=3.0,
+# #     alpha=0.5,
+# #     lr=0.01
+# # ):
+# #     student_model.to(device)
+# #     teacher_model.to(device)
+    
+# #     student_model.train()
+# #     teacher_model.eval()
+
+# #     # FIX: Strictly freeze teacher parameters to prevent massive memory leaks
+# #     for param in teacher_model.parameters():
+# #         param.requires_grad = False
+
+# #     criterion_hard = nn.CrossEntropyLoss()
+# #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+# #     optimizer = optim.SGD(
+# #         student_model.parameters(), 
+# #         lr=lr, 
+# #         momentum=0.9, 
+# #         weight_decay=1e-4 
+# #     )
+# #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+# #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
+# #                 epochs, temperature, alpha, lr, device)
+
+# #     for epoch in range(epochs):
+# #         running_loss = 0.0
+        
+# #         batch_iter = tqdm(train_loader, desc=f"Distill Epoch [{epoch + 1}/{epochs}]", leave=False, unit="batch")
+        
+# #         for batch_idx, (inputs, targets) in enumerate(batch_iter):
+# #             inputs, targets = inputs.to(device), targets.to(device)
+
+# #             optimizer.zero_grad()
+# #             student_logits = student_model(inputs)
+            
+# #             with torch.no_grad():
+# #                 teacher_logits = teacher_model(inputs)
+
+# #             loss_hard = criterion_hard(student_logits, targets)
+
+# #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+# #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+# #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+
+# #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+# #             loss.backward()
+# #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+# #             optimizer.step()
+# #             running_loss += loss.item()
+            
+# #             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
+
+# #             # FIX: Force memory cleanup to stop Windows SegFaults
+# #             del inputs, targets, student_logits, teacher_logits, loss_hard, loss_soft, loss
+# #             if batch_idx % 10 == 0:
+# #                 gc.collect()
+
+# #         scheduler.step()
+
+
+# # # # train/distill.py
+# # # import torch
+# # # import torch.nn as nn
+# # # import torch.nn.functional as F
+# # # import torch.optim as optim
+# # # from tqdm import tqdm
+# # # from utils.logger import get_logger
+
+# # # logger = get_logger("distill", logfile="logs/distill.log")
+
+# # # def train_with_distillation(
+# # #     student_model: nn.Module,
+# # #     teacher_model: nn.Module,
+# # #     train_loader,
+# # #     device="cpu",
+# # #     epochs=1,
+# # #     temperature=3.0,
+# # #     alpha=0.5,
+# # #     lr=0.01
+# # # ):
+# # #     student_model.to(device)
+# # #     teacher_model.to(device)
+    
+# # #     student_model.train()
+# # #     teacher_model.eval()
+
+# # #     criterion_hard = nn.CrossEntropyLoss()
+# # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+# # #     optimizer = optim.SGD(
+# # #         student_model.parameters(), 
+# # #         lr=lr, 
+# # #         momentum=0.9, 
+# # #         weight_decay=1e-4 
+# # #     )
+# # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+# # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
+# # #                 epochs, temperature, alpha, lr, device)
+
+# # #     for epoch in range(epochs):
+# # #         running_loss = 0.0
+        
+# # #         # Added tqdm progress bar for the distillation batch loop
+# # #         batch_iter = tqdm(train_loader, desc=f"Distill Epoch [{epoch + 1}/{epochs}]", leave=False, unit="batch")
+        
+# # #         for batch_idx, (inputs, targets) in enumerate(batch_iter):
+# # #             inputs, targets = inputs.to(device), targets.to(device)
+
+# # #             optimizer.zero_grad()
+# # #             student_logits = student_model(inputs)
+            
+# # #             with torch.no_grad():
+# # #                 teacher_logits = teacher_model(inputs)
+
+# # #             loss_hard = criterion_hard(student_logits, targets)
+
+# # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+# # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+# # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+
+# # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+# # #             loss.backward()
+# # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+# # #             optimizer.step()
+# # #             running_loss += loss.item()
+            
+# # #             # Update the progress bar with the current combined loss
+# # #             batch_iter.set_postfix(loss=f"{loss.item():.4f}")
+
+# # #         scheduler.step()
+
+
+# # # # # train/distill.py
+# # # # import torch
+# # # # import torch.nn as nn
+# # # # import torch.nn.functional as F
+# # # # import torch.optim as optim
+# # # # from utils.logger import get_logger
+
+# # # # logger = get_logger("distill", logfile="logs/distill.log")
+
+# # # # def train_with_distillation(
+# # # #     student_model: nn.Module,
+# # # #     teacher_model: nn.Module,
+# # # #     train_loader,
+# # # #     device="cpu",
+# # # #     epochs=1,
+# # # #     temperature=3.0,
+# # # #     alpha=0.5,
+# # # #     lr=0.01
+# # # # ):
+# # # #     student_model.to(device)
+# # # #     teacher_model.to(device)
+    
+# # # #     student_model.train()
+# # # #     teacher_model.eval()
+
+# # # #     criterion_hard = nn.CrossEntropyLoss()
+# # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+# # # #     optimizer = optim.SGD(
+# # # #         student_model.parameters(), 
+# # # #         lr=lr, 
+# # # #         momentum=0.9, 
+# # # #         weight_decay=1e-4 
+# # # #     )
+# # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+# # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f, LR=%f on %s", 
+# # # #                 epochs, temperature, alpha, lr, device)
+
+# # # #     for epoch in range(epochs):
+# # # #         running_loss = 0.0
+# # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
+# # # #             inputs, targets = inputs.to(device), targets.to(device)
+
+# # # #             optimizer.zero_grad()
+# # # #             student_logits = student_model(inputs)
+            
+# # # #             with torch.no_grad():
+# # # #                 teacher_logits = teacher_model(inputs)
+
+# # # #             loss_hard = criterion_hard(student_logits, targets)
+
+# # # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+# # # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+# # # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+
+# # # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+# # # #             loss.backward()
+# # # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+# # # #             optimizer.step()
+# # # #             running_loss += loss.item()
+
+# # # #         scheduler.step()
+
+# # # # # # train/distill.py
+# # # # # import torch
+# # # # # import torch.nn as nn
+# # # # # import torch.nn.functional as F
+# # # # # import torch.optim as optim
+# # # # # from utils.logger import get_logger
+
+# # # # # logger = get_logger("distill", logfile="logs/distill.log")
+
+# # # # # def train_with_distillation(
+# # # # #     student_model: nn.Module,
+# # # # #     teacher_model: nn.Module,
+# # # # #     train_loader,
+# # # # #     device="cpu",
+# # # # #     epochs=1,
+# # # # #     temperature=3.0,
+# # # # #     alpha=0.5
+# # # # # ):
+# # # # #     """
+# # # # #     Trains a student model using soft targets from a frozen teacher model.
+# # # # #     Args:
+# # # # #         student_model: The new child Architecture (to be trained).
+# # # # #         teacher_model: The parent Architecture (frozen).
+# # # # #         train_loader: DataLoader for the training set.
+# # # # #         device: "cpu" or "cuda".
+# # # # #         epochs: Number of epochs to train.
+# # # # #         temperature: Softens the teacher's probability distribution (higher = softer).
+# # # # #         alpha: Weighting between the hard loss (true labels) and soft loss (teacher labels).
+# # # # #                alpha=0.5 means a 50/50 split.
+# # # # #     """
+# # # # #     student_model.to(device)
+# # # # #     teacher_model.to(device)
+    
+# # # # #     # The student learns; the teacher only predicts.
+# # # # #     student_model.train()
+# # # # #     teacher_model.eval()
+
+# # # # #     # Hard targets (Standard Cross Entropy)
+# # # # #     criterion_hard = nn.CrossEntropyLoss()
+# # # # #     # Soft targets (Kullback-Leibler Divergence)
+# # # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+# # # # #     # Setup matching the standard trainer.py to ensure fair comparisons
+# # # # #     optimizer = optim.SGD(
+# # # # #         student_model.parameters(), 
+# # # # #         lr=0.01, 
+# # # # #         momentum=0.9, 
+# # # # #         weight_decay=1e-4 
+# # # # #     )
+# # # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+# # # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f on %s", 
+# # # # #                 epochs, temperature, alpha, device)
+
+# # # # #     for epoch in range(epochs):
+# # # # #         running_loss = 0.0
+        
+# # # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
+# # # # #             inputs, targets = inputs.to(device), targets.to(device)
+
+# # # # #             optimizer.zero_grad()
+
+# # # # #             # 1. Forward pass for the student
+# # # # #             student_logits = student_model(inputs)
+            
+# # # # #             # 2. Forward pass for the frozen teacher
+# # # # #             with torch.no_grad():
+# # # # #                 teacher_logits = teacher_model(inputs)
+
+# # # # #             # 3. Calculate Hard Loss (Student vs. True Labels)
+# # # # #             loss_hard = criterion_hard(student_logits, targets)
+
+# # # # #             # 4. Calculate Soft Loss (Student vs. Teacher)
+# # # # #             # Log-Softmax for the student, standard Softmax for the teacher
+# # # # #             student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+# # # # #             teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+            
+# # # # #             # Multiply by T^2 to scale the gradients back up
+# # # # #             loss_soft = criterion_soft(student_log_probs, teacher_probs) * (temperature ** 2)
+
+# # # # #             # 5. Combine Losses
+# # # # #             loss = (alpha * loss_hard) + ((1.0 - alpha) * loss_soft)
+
+# # # # #             # 6. Backward pass and Optimization
+# # # # #             loss.backward()
+            
+# # # # #             # Gradient clipping to match trainer.py and prevent loss spikes
+# # # # #             torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=5.0)
+            
+# # # # #             optimizer.step()
+# # # # #             running_loss += loss.item()
+
+# # # # #         scheduler.step()
+# # # # #         logger.debug("Distillation Epoch [%d/%d] completed. Avg Loss: %.4f", epoch + 1, epochs, running_loss / len(train_loader))
+
+# # # # #     logger.info("Distillation training complete.")
+
+# # # # # # # train/distill.py
+# # # # # # import torch
+# # # # # # import torch.nn as nn
+# # # # # # import torch.nn.functional as F
+# # # # # # import torch.optim as optim
+# # # # # # from utils.logger import get_logger
+
+# # # # # # logger = get_logger("distill", logfile="logs/distill.log")
+
+# # # # # # def train_with_distillation(
+# # # # # #     student_model: nn.Module,
+# # # # # #     teacher_model: nn.Module,
+# # # # # #     train_loader,
+# # # # # #     device="cpu",
+# # # # # #     epochs=1,
+# # # # # #     temperature=3.0,
+# # # # # #     alpha=0.5
+# # # # # # ):
+# # # # # #     """
+# # # # # #     Trains a student model using soft targets from a frozen teacher model.
+    
+# # # # # #     Args:
+# # # # # #         student_model: The new child Architecture (to be trained).
+# # # # # #         teacher_model: The parent Architecture (frozen).
+# # # # # #         train_loader: DataLoader for the training set.
+# # # # # #         device: "cpu" or "cuda".
+# # # # # #         epochs: Number of epochs to train.
+# # # # # #         temperature: Softens the teacher's probability distribution (higher = softer).
+# # # # # #         alpha: Weighting between the hard loss (true labels) and soft loss (teacher labels).
+# # # # # #                alpha=0.5 means a 50/50 split.
+# # # # # #     """
+# # # # # #     student_model.to(device)
+# # # # # #     teacher_model.to(device)
+    
+# # # # # #     # The student learns; the teacher only predicts.
+# # # # # #     student_model.train()
+# # # # # #     teacher_model.eval()
+
+# # # # # #     # Hard targets (Standard Cross Entropy)
+# # # # # #     criterion_hard = nn.CrossEntropyLoss()
+# # # # # #     # Soft targets (Kullback-Leibler Divergence)
+# # # # # #     criterion_soft = nn.KLDivLoss(reduction='batchmean')
+    
+# # # # # #     # Setup matching the standard trainer.py to ensure fair comparisons
+# # # # # #     optimizer = optim.SGD(
+# # # # # #         student_model.parameters(), 
+# # # # # #         lr=0.01, 
+# # # # # #         momentum=0.9, 
+# # # # # #         weight_decay=1e-4 
+# # # # # #     )
+# # # # # #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+# # # # # #     logger.info("Starting Distillation: epochs=%d, T=%.1f, alpha=%.2f on %s", 
+# # # # # #                 epochs, temperature, alpha, device)
+
+# # # # # #     for epoch in range(epochs):
+# # # # # #         running_loss = 0.0
+        
+# # # # # #         for batch_idx, (inputs, targets) in enumerate(train_loader):
+# # # # # #             inputs, targets = inputs.to(device), targets.to(device)
+
+# # # # # #             optimizer.zero_grad()
+
+# # # # # #             # 1. Forward pass for the student
+# # # # # #             student_logits = student_model(inputs)
+            
+# # # # # #             # 2. Forward pass for the frozen teacher
+# # # # # #             with torch.no_grad():
+# # # # # #                 teacher_logits = teacher_model(inputs)
+
+# # # # # #             # 3. Calculate Hard Loss (Student vs. True Labels)
+# # # # # #             loss_hard = criterion_hard(student_logits, targets)
+
+# # # # # #             # 4. Calculate Soft Loss (Student vs. Teacher)
+# # # # # #             # Log-Softmax for the student, standard
 
 ================================================================================
 END OF: train/distill.py
@@ -5427,48 +6372,41 @@ from utils.logger import get_logger
 
 logger = get_logger("evaluate", logfile="logs/evaluate.log")
 
-
-def evaluate_accuracy(model, val_loader, device="cpu", use_amp=False) -> float:
+def evaluate_accuracy(model, val_loader, device="cpu"):
     """
-    Returns validation error in [0, 1].  Lower is better.
-
-    Parameters
-    ----------
-    use_amp : bool
-        Use fp16 for inference — faster on GPU, no accuracy change.
-        Automatically disabled if device is not CUDA.
+    Calculates validation error. 
+    Returns: float (error rate between 0.0 and 1.0, lower is better)
     """
-    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
-    use_amp = use_amp and is_cuda
-
     model.to(device)
-    model.eval()
-
+    
+    # FIX: Explicit eval mode. Without this, passing a batch through 
+    # the network will corrupt BatchNorm running statistics.
+    model.eval() 
+    
     correct = 0
-    total   = 0
+    total = 0
 
+    # FIX: no_grad() prevents PyTorch from building a computation graph 
+    # during validation, saving massive amounts of VRAM.
     with torch.no_grad():
         for inputs, targets in val_loader:
-            inputs  = inputs.to(device,  non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    outputs = model(inputs)
-            else:
-                outputs = model(inputs)
-
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            outputs = model(inputs)
             _, predicted = outputs.max(1)
-            total   += targets.size(0)
+            
+            total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
     if total == 0:
-        logger.warning("Empty validation loader — returning error=1.0")
+        logger.warning("Validation loader is empty! Returning 1.0 error.")
         return 1.0
 
-    acc       = correct / total
-    val_error = 1.0 - acc
-    logger.debug("Val accuracy=%.2f%%  val_error=%.4f", acc * 100, val_error)
+    accuracy = correct / total
+    val_error = 1.0 - accuracy
+    
+    logger.info("Evaluation complete. Accuracy: %.2f%%, Val Error: %.4f", accuracy * 100, val_error)
+    
     return val_error
 
 ================================================================================
@@ -5493,39 +6431,32 @@ logger = get_logger("trainer", logfile="logs/trainer.log")
 
 def _build_optimizer(model, optimizer_name: str, lr: float, weight_decay: float):
     params = [p for p in model.parameters() if p.requires_grad]
-    name   = optimizer_name.lower()
+    name = optimizer_name.lower()
     if name == "adam":
         return optim.Adam(params, lr=lr, weight_decay=weight_decay)
     elif name == "adamw":
         return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    else:  # sgd (default)
+    else:  # default: sgd
         return optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
 
 
 def train_model(model, train_loader, device="cpu", epochs=1,
                 lr=0.01, weight_decay=1e-4,
-                optimizer_name="sgd",
-                show_progress=True,
-                use_amp=False):
+                optimizer_name="sgd", show_progress=True):
     """
     Standard supervised training loop.
 
     Parameters
     ----------
-    model          : nn.Module — trained IN-PLACE on *device*.
+    model          : nn.Module — trained IN-PLACE on the given device.
     train_loader   : DataLoader
     device         : "cpu" or "cuda"
     epochs         : number of full passes over train_loader
     lr             : learning rate
-    weight_decay   : L2 regularisation
+    weight_decay   : L2 regularisation coefficient
     optimizer_name : "sgd" | "adam" | "adamw"
-    show_progress  : print tqdm bar (disable in subprocess workers)
-    use_amp        : Automatic Mixed Precision — fp16 forward, fp32 gradients.
-                     Gives 1.5-2x GPU speedup.  Automatically disabled on CPU.
+    show_progress  : if True, print per-epoch loss (no tqdm in workers)
     """
-    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
-    use_amp = use_amp and is_cuda   # AMP only works on CUDA
-
     model.to(device)
     model.train()
 
@@ -5534,58 +6465,36 @@ def train_model(model, train_loader, device="cpu", epochs=1,
         logger.warning("No trainable params — skipping training.")
         return
 
-    optimizer  = _build_optimizer(model, optimizer_name, lr, weight_decay)
-    scheduler  = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
-    criterion  = nn.CrossEntropyLoss()
+    optimizer = _build_optimizer(model, optimizer_name, lr, weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    criterion = nn.CrossEntropyLoss()
 
-    # GradScaler for AMP — no-op if use_amp=False
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-
-    logger.info("train_model: epochs=%d lr=%.4f opt=%s device=%s amp=%s",
-                epochs, lr, optimizer_name, device, use_amp)
+    logger.info("train_model: epochs=%d lr=%.4f opt=%s device=%s",
+                epochs, lr, optimizer_name, device)
 
     for epoch in range(epochs):
         running_loss = 0.0
-        n_batches    = 0
+        n_batches = 0
 
-        if show_progress:
-            try:
-                from tqdm import tqdm
-                batch_iter = tqdm(train_loader,
-                                  desc=f"Train [{epoch+1}/{epochs}]",
-                                  leave=False, unit="batch")
-            except ImportError:
-                batch_iter = train_loader
-        else:
+        try:
+            from tqdm.auto import tqdm
+            batch_iter = tqdm(train_loader, desc=f"Train [{epoch+1}/{epochs}]",
+                            leave=False, unit="batch", disable=not show_progress)
+        except ImportError:
             batch_iter = train_loader
 
         for inputs, targets in batch_iter:
-            # non_blocking=True overlaps CPU→GPU transfer with GPU compute
-            inputs  = inputs.to(device,  non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-
-            if use_amp:
-                # fp16 forward pass
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    outputs = model(inputs)
-                    loss    = criterion(outputs, targets)
-                # fp32 backward (scaler converts grads back)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(inputs)
-                loss    = criterion(outputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
             running_loss += loss.item()
-            n_batches    += 1
+            n_batches += 1
 
             if show_progress and hasattr(batch_iter, "set_postfix"):
                 batch_iter.set_postfix(loss=f"{loss.item():.4f}")
@@ -6095,8 +7004,7 @@ def main():
     # =========================================================================
     # CONFIGURATION: Set your specific timestamp / experiment folder here
     # =========================================================================
-    RUN_DIR = r"results_CIFAR-100_20260412_174406" 
-    # 100_20260412_174406
+    RUN_DIR = r"results_CIFAR-100_20260412_191158" 
     # RUN_DIR = r"results_CIFAR-10_20260412_111857" 
     # results_CIFAR-100_20260412_191158
     

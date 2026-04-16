@@ -15,7 +15,7 @@ class NASConfig:
     # Dataset
     # Options: "CIFAR-10" | "CIFAR-100" | "IMAGENET"
     # -------------------------------------------------------------------------
-    TARGET_DATASET: str = "CIFAR-100"
+    TARGET_DATASET: str = "CIFAR-10"
 
     # True  → small subset of data (fast iteration / debugging)
     # False → full dataset (production runs)
@@ -31,15 +31,15 @@ class NASConfig:
     #   ["params"]           → params-only (fast, no model build for cheap eval)
     #   []                   → single-objective NAS (val_error only)
     # -------------------------------------------------------------------------
-    CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params"])
+    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params"])
     # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: [])
-    # CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params", "flops"])
+    CHEAP_OBJECTIVES: List[str] = field(default_factory=lambda: ["params", "flops"])
 
     # -------------------------------------------------------------------------
     # Evolution
     # -------------------------------------------------------------------------
-    GENERATIONS: int = 5
-    NUM_SEEDS: int = 12
+    GENERATIONS: int = 20
+    NUM_SEEDS: int = 8
 
     # npc: candidates generated per generation.  Must be > N_ACCEPT.
     N_CHILDREN: int = 24
@@ -63,9 +63,9 @@ class NASConfig:
     #   DISTILL_EPOCHS: ANM children only — distillation alignment BEFORE
     #                   the standard CHILD_EPOCHS training phase
     # -------------------------------------------------------------------------
-    INIT_EPOCHS: int = 20
-    CHILD_EPOCHS: int = 12
-    DISTILL_EPOCHS: int = 5
+    INIT_EPOCHS: int = 10
+    CHILD_EPOCHS: int = 3
+    DISTILL_EPOCHS: int = 1
 
     # Set True to add +1 epoch every 5 generations (slow convergence boost)
     EPOCH_PROGRESSION: bool = True
